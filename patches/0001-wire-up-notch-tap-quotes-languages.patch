@@ -1,0 +1,313 @@
+diff --git a/VoiceInk/App/Configuration/AppDefaults.swift b/VoiceInk/App/Configuration/AppDefaults.swift
+index 764f8a3..4ee0aee 100644
+--- a/VoiceInk/App/Configuration/AppDefaults.swift
++++ b/VoiceInk/App/Configuration/AppDefaults.swift
+@@ -56,7 +56,8 @@ enum AppDefaults {
+             "IsVADEnabled": true,
+             "SelectedLanguage": "en",
+             "AppendTrailingSpace": true,
+-            "RecorderType": "mini",
++            "RecorderType": "notch",
++            FourFingerTapMonitor.enabledKey: true,
+             RecorderDisplaySettingsKeys.showLiveTranscript: true,
+             CloudTranscriptionSettings.timeoutKey: CloudTranscriptionSettings.defaultTimeout,
+ 
+diff --git a/VoiceInk/App/VoiceInk.swift b/VoiceInk/App/VoiceInk.swift
+index 62ddbb1..b71457e 100644
+--- a/VoiceInk/App/VoiceInk.swift
++++ b/VoiceInk/App/VoiceInk.swift
+@@ -160,6 +160,14 @@ struct VoiceInkApp: App {
+         let recordingShortcutManager = RecordingShortcutManager(engine: engine, recorderUIManager: recorderUIManager)
+         _recordingShortcutManager = StateObject(wrappedValue: recordingShortcutManager)
+ 
++        // Four-finger tap on the trackpad starts/stops dictation.
++        FourFingerTapMonitor.shared.onTap = { [weak recorderUIManager] in
++            Task { @MainActor in
++                await recorderUIManager?.handleTrackpadTap()
++            }
++        }
++        FourFingerTapMonitor.shared.applyStoredPreference()
++
+         let menuBarManager = MenuBarManager()
+         _menuBarManager = StateObject(wrappedValue: menuBarManager)
+         menuBarManager.configure(engine: engine)
+diff --git a/VoiceInk/Core/Enhancement/AIPrompts.swift b/VoiceInk/Core/Enhancement/AIPrompts.swift
+index cf9cae4..dbefc23 100644
+--- a/VoiceInk/Core/Enhancement/AIPrompts.swift
++++ b/VoiceInk/Core/Enhancement/AIPrompts.swift
+@@ -12,7 +12,11 @@ enum AIPrompts {
+         - Correct only what is necessary for accurate, readable transcription: obvious ASR, spelling, grammar, capitalization, punctuation, and sentence-boundary errors. Never add unspoken information or remove meaningful information. When uncertain, preserve the original wording.
+         - Remove stutters, accidental repetition, and abandoned false starts.
+         - For clear self-corrections, remove the rejected wording and correction signal, keeping only the final intended wording. Correction signals may include “wait”, “wait no”, “actually”, “sorry”, “scratch that”, “I mean”, “no”, and similar expressions. Preserve these expressions when they carry independent meaning or emphasis.
+-        - Apply spoken formatting cues such as “comma”, “period”, “question mark”, “new line”, and “new paragraph” where they are dictated.
++        - Apply spoken formatting cues such as “comma”, “period”, “question mark”, “new line”, and “new paragraph” where they are dictated, in any language (for example “Komma”, “Punkt”, “Fragezeichen”, “neue Zeile”, “neuer Absatz”; “virgule”, “point”, “à la ligne”; “coma”, “punto”, “nueva línea”).
++        - Detect quotations automatically. When the speaker repeats someone’s or something’s exact words (direct speech after verbs such as said, wrote, asked, replied, “gesagt”, “meinte”, “schrieb”, “fragte”, “a dit”, “dijo”; or the exact text of a message, error, sign, title, or slogan), put those exact words in quotation marks. Signs of direct speech include a switch to first person or to the quoted person’s own wording.
++        - Do not add quotation marks to indirect or reported speech (for example “Er sagte, dass er später kommt”, “Sie meinte, sie komme später”, “He said he would be late”).
++        - Spoken quote markers such as “quote … end quote”, “quote … unquote”, “Zitat … Zitat Ende”, “Anführungszeichen … Anführungszeichen zu / Ende”, “entre guillemets … fin de citation”, “comillas … cierro comillas” or “cita … fin de la cita” mark the start and end of a quotation: remove the markers and put the enclosed words in quotation marks. If no end marker is spoken, end the quotation where the quoted sentence naturally ends.
++        - Use the quotation marks of the transcript’s language: German „…“ (nested ‚…‘), English “…” (nested ‘…’), French « … » with spaces inside, Spanish «…» (nested “…”). In German, introduce direct speech with a colon after the speech verb and capitalize its first word (Er sagte: „Ich komme morgen.“).
+         - Write clear spoken numbers as digits, except small numbers that read more naturally as words. Use standard forms for dates, times, currencies, percentages, measurements, phone numbers, email addresses, URLs, code, filenames, and file paths. Never guess unclear values.
+         - Use readable paragraphs. Start a new paragraph when the speaker moves to a new idea, question, topic, or tone. Keep paragraphs to no more than three sentences or about 40 words, whichever is shorter.
+         - Format clear enumerations as vertical lists, even when spoken as continuous text. Use numbered lists for ordered steps and bullet lists for unordered items. Keep ordinary mentions of connected items in prose.
+@@ -46,6 +50,18 @@ enum AIPrompts {
+ 
+         Input: The first invoice is five hundred dollars, the second is thirty-five dollars, and the local fee is three hundred rupees.
+         Output: The first invoice is $500, the second is $35, and the local fee is ₹300.
++
++        Input: Mein Chef hat gesagt ich will das bis Freitag auf dem Tisch haben also mach ich das heute noch
++        Output: Mein Chef hat gesagt: „Ich will das bis Freitag auf dem Tisch haben.“ Also mach ich das heute noch.
++
++        Input: Sie meinte sie kommt etwas später
++        Output: Sie meinte, sie kommt etwas später.
++
++        Input: In der Fehlermeldung steht Zitat file not found Zitat Ende und dann stürzt die App ab
++        Output: In der Fehlermeldung steht „file not found“ und dann stürzt die App ab.
++
++        Input: She told me quote we ship on Monday end quote so plan accordingly
++        Output: She told me, “We ship on Monday,” so plan accordingly.
+         </EXAMPLES>
+ 
+         <OUTPUT_REQUIREMENTS>
+diff --git a/VoiceInk/Features/ModelLibrary/Models/LanguageDictionary.swift b/VoiceInk/Features/ModelLibrary/Models/LanguageDictionary.swift
+index deceb9d..38a382f 100644
+--- a/VoiceInk/Features/ModelLibrary/Models/LanguageDictionary.swift
++++ b/VoiceInk/Features/ModelLibrary/Models/LanguageDictionary.swift
+@@ -1,8 +1,26 @@
+ import Foundation
+ 
+ enum TranscriptionLanguageSupport {
++    /// Dictation languages offered in this build: German, English, French and Spanish
++    /// (including regional variants such as en-US or es-419) plus automatic detection.
++    static let preferredLanguageBases: Set<String> = ["de", "en", "fr", "es"]
++
+     static func languages(for model: any TranscriptionModel, realtimeEnabled: Bool? = nil) -> [String: String] {
+-        model.supportedLanguages
++        restrictedToPreferred(model.supportedLanguages)
++    }
++
++    static func restrictedToPreferred(_ all: [String: String]) -> [String: String] {
++        let filtered = all.filter { code, _ in
++            code == "auto" || preferredLanguageBases.contains(baseLanguage(of: code))
++        }
++        // A model that supports none of them (e.g. an English-only model) keeps its own list.
++        return filtered.isEmpty ? all : filtered
++    }
++
++    private static func baseLanguage(of code: String) -> String {
++        let separators: Set<Character> = ["-", "_"]
++        let base = code.split(whereSeparator: { separators.contains($0) }).first.map(String.init) ?? code
++        return base.lowercased()
+     }
+ 
+     static func validLanguageOrFallback(
+diff --git a/VoiceInk/Features/ModelLibrary/Views/ModelSettingsPanel.swift b/VoiceInk/Features/ModelLibrary/Views/ModelSettingsPanel.swift
+index c3c3636..7b15ad7 100644
+--- a/VoiceInk/Features/ModelLibrary/Views/ModelSettingsPanel.swift
++++ b/VoiceInk/Features/ModelLibrary/Views/ModelSettingsPanel.swift
+@@ -94,7 +94,8 @@ private struct WhisperPromptSettingsSection: View {
+     @State private var isEditing = false
+ 
+     private var supportedLanguages: [String: String] {
+-        LanguageDictionary.forProvider(isMultilingual: true, provider: .whisper)
++        TranscriptionLanguageSupport.restrictedToPreferred(
++            LanguageDictionary.forProvider(isMultilingual: true, provider: .whisper))
+     }
+ 
+     private var savedPrompt: String {
+diff --git a/VoiceInk/Features/Recording/Presentation/RecorderUIManager.swift b/VoiceInk/Features/Recording/Presentation/RecorderUIManager.swift
+index 98d373b..99a9897 100644
+--- a/VoiceInk/Features/Recording/Presentation/RecorderUIManager.swift
++++ b/VoiceInk/Features/Recording/Presentation/RecorderUIManager.swift
+@@ -20,8 +20,8 @@ enum RecorderPanelStyle: String, CaseIterable, Identifiable {
+     }
+ 
+     static var stored: RecorderPanelStyle {
+-        let rawValue = UserDefaults.standard.string(forKey: "RecorderType") ?? RecorderPanelStyle.mini.rawValue
+-        return RecorderPanelStyle(rawValue: rawValue) ?? .mini
++        let rawValue = UserDefaults.standard.string(forKey: "RecorderType") ?? RecorderPanelStyle.notch.rawValue
++        return RecorderPanelStyle(rawValue: rawValue) ?? .notch
+     }
+ }
+ 
+@@ -38,12 +38,13 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
+             guard oldValue != recorderPanelStyle else { return }
+             rebuildVisiblePanel(previousStyle: oldValue)
+             UserDefaults.standard.set(recorderPanelStyle.rawValue, forKey: "RecorderType")
++            updateNotchIsland()
+         }
+     }
+ 
+     var recorderType: String {
+         get { recorderPanelStyle.rawValue }
+-        set { recorderPanelStyle = RecorderPanelStyle(rawValue: newValue) ?? .mini }
++        set { recorderPanelStyle = RecorderPanelStyle(rawValue: newValue) ?? .notch }
+     }
+ 
+     @Published var isRecorderPanelVisible = false {
+@@ -60,6 +61,8 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
+     }
+ 
+     private var notchWindowManager: NotchWindowManager?
++    /// Always-present Dynamic-Island style notch (replaces the per-dictation notch panel).
++    private var notchIsland: NotchIslandController?
+     private var miniWindowManager: MiniWindowManager?
+     private var panelInvalidationTask: Task<Void, Never>?
+     private var didSetupNotifications = false
+@@ -82,6 +85,64 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
+         self.engine = engine
+         self.recorder = recorder
+         setupNotifications()
++        // Wait until the app has finished launching before putting a window on screen.
++        Task { @MainActor [weak self] in
++            try? await Task.sleep(nanoseconds: 300_000_000)
++            self?.updateNotchIsland()
++        }
++    }
++
++    // MARK: - Notch Island
++
++    /// Creates the idle notch when the notch style is selected and removes it otherwise.
++    private func updateNotchIsland() {
++        guard recorderPanelStyle == .notch else {
++            notchIsland?.destroy()
++            notchIsland = nil
++            return
++        }
++        guard let engine, let recorder else { return }
++
++        if notchIsland == nil {
++            notchIsland = NotchIslandController(
++                engine: engine,
++                recorder: recorder,
++                onTap: { [weak self] in
++                    Task { @MainActor in
++                        await self?.handleNotchTap()
++                    }
++                },
++                onClose: { [weak self] in
++                    Task { @MainActor in
++                        await self?.dismissRecorderPanel()
++                    }
++                },
++                onAssistantFollowUp: { [weak engine] text in
++                    Task { @MainActor in
++                        await engine?.sendAssistantFollowUp(text)
++                    }
++                }
++            )
++        }
++        notchIsland?.showIdle()
++    }
++
++    /// Clicking the notch starts a dictation, or finishes the running one.
++    private func handleNotchTap() async {
++        await handleTrackpadTap()
++    }
++
++    /// Four-finger tap (and notch click): start dictating, or stop and insert the text.
++    /// Taps while the text is still being processed are ignored so nothing gets lost.
++    func handleTrackpadTap() async {
++        guard let engine else { return }
++        switch engine.recordingState {
++        case .starting, .transcribing, .enhancing, .busy:
++            ShortcutDiagnostics.notice("trackpad-tap result=ignored state=\(engine.recordingState)")
++            return
++        case .idle, .recording:
++            await toggleRecorderPanel()
++        }
+     }
+ 
+     // MARK: - Recorder Panel Management
+@@ -93,29 +154,8 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
+ 
+         switch recorderPanelStyle {
+         case .notch:
+-            if notchWindowManager == nil {
+-                notchWindowManager = NotchWindowManager(
+-                    engine: engine,
+-                    recorder: recorder,
+-                    assistantSession: engine.assistantSession,
+-                    onRecordButtonTapped: { [weak self] in
+-                        Task { @MainActor in
+-                            await self?.toggleRecorderPanel()
+-                        }
+-                    },
+-                    onCloseTapped: { [weak self] in
+-                        Task { @MainActor in
+-                            await self?.dismissRecorderPanel()
+-                        }
+-                    },
+-                    onAssistantFollowUp: { [weak engine] text in
+-                        Task { @MainActor in
+-                            await engine?.sendAssistantFollowUp(text)
+-                        }
+-                    }
+-                )
+-            }
+-            shown = notchWindowManager?.show() ?? false
++            if notchIsland == nil { updateNotchIsland() }
++            shown = notchIsland?.beginSession() ?? false
+         case .mini:
+             if miniWindowManager == nil {
+                 miniWindowManager = MiniWindowManager(
+@@ -158,7 +198,7 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
+         logger.debug("Hiding recorder panel style=\(self.recorderPanelStyle.rawValue, privacy: .public)")
+         switch recorderPanelStyle {
+         case .notch:
+-            notchWindowManager?.hide()
++            notchIsland?.endSession()
+         case .mini:
+             miniWindowManager?.hide()
+         }
+@@ -187,6 +227,8 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
+     }
+ 
+     private func applyPanelInvalidation(reason: String) {
++        notchIsland?.refresh()
++
+         guard isRecorderPanelVisible else {
+             logger.notice("Discarding idle recorder panels (\(reason, privacy: .public))")
+             notchWindowManager?.destroyWindow()
+@@ -205,8 +247,7 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
+ 
+         switch previousStyle {
+         case .notch:
+-            notchWindowManager?.destroyWindow()
+-            notchWindowManager = nil
++            notchIsland?.endSession()
+         case .mini:
+             miniWindowManager?.destroyWindow()
+             miniWindowManager = nil
+diff --git a/VoiceInk/Features/Settings/Views/SettingsView.swift b/VoiceInk/Features/Settings/Views/SettingsView.swift
+index 2cb2113..4928b11 100644
+--- a/VoiceInk/Features/Settings/Views/SettingsView.swift
++++ b/VoiceInk/Features/Settings/Views/SettingsView.swift
+@@ -25,6 +25,7 @@ struct SettingsView: View {
+     @AppStorage(AppLanguagePreference.userDefaultsKey) private var appLanguagePreference = AppLanguagePreference
+         .systemValue
+     @AppStorage(RecorderDisplaySettingsKeys.showLiveTranscript) private var showLiveTranscript = true
++    @AppStorage(FourFingerTapMonitor.enabledKey) private var fourFingerTapEnabled = true
+     @AppStorage(FinishAndSendSettings.key) private var finishAndSendKey = FinishAndSendKey.none.rawValue
+     @State private var showResetOnboardingAlert = false
+     @State private var showLanguageRestartAlert = false
+@@ -235,6 +236,21 @@ struct SettingsView: View {
+                         InfoTip("Shows live text while recording with realtime models.")
+                     }
+                 }
++
++                Toggle(isOn: $fourFingerTapEnabled) {
++                    HStack(spacing: 4) {
++                        Text("Four-Finger Tap to Dictate", tableName: "NotchIsland")
++                        InfoTip(
++                            String(
++                                localized: "Tap the trackpad with four fingers to start dictating. Tap again to stop and insert the text.",
++                                table: "NotchIsland"
++                            )
++                        )
++                    }
++                }
++                .onChange(of: fourFingerTapEnabled) { _, newValue in
++                    FourFingerTapMonitor.shared.setEnabled(newValue)
++                }
+             }
+ 
+             Section("General") {
