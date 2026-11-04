@@ -1,0 +1,807 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+new file mode 100644
+index 0000000..6e0b527
+--- /dev/null
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -0,0 +1,456 @@
++import AppKit
++import Combine
++import SwiftUI
++import os
++
++// MARK: - Geometry
++
++/// Size of the hardware notch (or a virtual one on displays without a notch).
++struct NotchGeometry: Equatable {
++    let screenFrame: NSRect
++    let notchWidth: CGFloat
++    let notchHeight: CGFloat
++    let hasNotch: Bool
++
++    @MainActor
++    static func make(for screen: NSScreen) -> NotchGeometry {
++        let hasNotch = screen.safeAreaInsets.top > 0
++
++        let height: CGFloat = {
++            if hasNotch { return screen.safeAreaInsets.top }
++            let menuBar = NSApplication.shared.mainMenu?.menuBarHeight ?? 0
++            return menuBar > 0 ? menuBar : NSStatusBar.system.thickness
++        }()
++
++        let width: CGFloat = {
++            if let left = screen.auxiliaryTopLeftArea?.width,
++                let right = screen.auxiliaryTopRightArea?.width
++            {
++                return screen.frame.width - left - right
++            }
++            return 180
++        }()
++
++        return NotchGeometry(screenFrame: screen.frame, notchWidth: width, notchHeight: height, hasNotch: hasNotch)
++    }
++
++    static let fallback = NotchGeometry(
++        screenFrame: NSRect(x: 0, y: 0, width: 1440, height: 900),
++        notchWidth: 180,
++        notchHeight: 32,
++        hasNotch: false
++    )
++}
++
++// MARK: - Phase
++
++enum NotchIslandPhase: Equatable {
++    /// Nothing drawn (display without a notch, nothing going on).
++    case hidden
++    /// Sits invisibly behind the hardware notch.
++    case idle
++    /// Pointer is on the notch: grows a little and can be clicked to start dictating.
++    case hover
++    /// Listening. Slightly larger than the notch and glowing.
++    case recording
++    /// Transcribing / AI clean-up.
++    case processing
++    /// Listening with streaming text shown underneath.
++    case liveText
++    /// Assistant answer panel.
++    case assistant
++
++    var isActive: Bool {
++        switch self {
++        case .recording, .processing, .liveText, .assistant: return true
++        case .hidden, .idle, .hover: return false
++        }
++    }
++}
++
++// MARK: - Model
++
++@MainActor
++final class NotchIslandModel: ObservableObject {
++    @Published var geometry: NotchGeometry
++    @Published var isHovering = false
++    @Published var sessionActive = false
++    @Published var targetAppIcon: NSImage?
++    @Published private(set) var recordingState: RecordingState = .idle
++    @Published private(set) var partialTranscript = ""
++    @Published private(set) var assistantVisible = false
++
++    private var cancellables = Set<AnyCancellable>()
++
++    // Extra width on each side of the notch and extra height below it, per phase.
++    static let hoverWing: CGFloat = 22
++    static let activeWing: CGFloat = 50
++    static let liveTextWing: CGFloat = 110
++    static let assistantWing: CGFloat = 230
++    static let rowBonus: CGFloat = 5
++    static let liveTextPanelHeight: CGFloat = 57
++    static let assistantPanelHeight: CGFloat = 320
++    /// Room around the island for the glow.
++    static let glowPadding: CGFloat = 34
++
++    init(engine: VoiceInkEngine, geometry: NotchGeometry) {
++        self.geometry = geometry
++
++        engine.$recordingState
++            .removeDuplicates()
++            .sink { [weak self] state in self?.recordingState = state }
++            .store(in: &cancellables)
++
++        engine.$partialTranscript
++            .removeDuplicates()
++            .sink { [weak self] text in self?.partialTranscript = text }
++            .store(in: &cancellables)
++
++        engine.assistantSession.$phase
++            .map { $0 != .inactive }
++            .removeDuplicates()
++            .sink { [weak self] visible in self?.assistantVisible = visible }
++            .store(in: &cancellables)
++    }
++
++    private var showsLiveTranscript: Bool {
++        UserDefaults.standard.object(forKey: RecorderDisplaySettingsKeys.showLiveTranscript) as? Bool ?? true
++    }
++
++    var phase: NotchIslandPhase {
++        if assistantVisible { return .assistant }
++
++        switch recordingState {
++        case .recording:
++            return showsLiveTranscript && !partialTranscript.isEmpty ? .liveText : .recording
++        case .starting:
++            return .recording
++        case .transcribing, .enhancing, .busy:
++            return .processing
++        case .idle:
++            break
++        }
++
++        if isHovering { return .hover }
++        return geometry.hasNotch ? .idle : .hidden
++    }
++
++    var rowHeight: CGFloat {
++        switch phase {
++        case .hidden, .idle: return geometry.notchHeight
++        default: return geometry.notchHeight + Self.rowBonus
++        }
++    }
++
++    func size(for phase: NotchIslandPhase) -> CGSize {
++        let width = geometry.notchWidth
++        let height = geometry.notchHeight
++        let row = height + Self.rowBonus
++
++        switch phase {
++        case .hidden:
++            return CGSize(width: width, height: 0)
++        case .idle:
++            // A touch smaller than the hardware notch so no edge ever peeks out.
++            return CGSize(width: max(0, width - 8), height: max(0, height - 2))
++        case .hover:
++            return CGSize(width: width + Self.hoverWing * 2, height: row)
++        case .recording, .processing:
++            return CGSize(width: width + Self.activeWing * 2, height: row)
++        case .liveText:
++            return CGSize(width: width + Self.liveTextWing * 2, height: row + Self.liveTextPanelHeight)
++        case .assistant:
++            return CGSize(width: width + Self.assistantWing * 2, height: row + Self.assistantPanelHeight)
++        }
++    }
++
++    /// Fixed size of the transparent window that hosts the island in every phase.
++    var windowSize: CGSize {
++        let largest = size(for: .assistant)
++        return CGSize(
++            width: largest.width + Self.glowPadding * 2,
++            height: largest.height + Self.glowPadding
++        )
++    }
++
++    /// Screen rect in which the pointer counts as "on the island".
++    func hitRect() -> NSRect {
++        let current = phase
++        let size: CGSize
++        switch current {
++        case .hidden, .idle:
++            size = CGSize(width: geometry.notchWidth, height: geometry.notchHeight)
++        default:
++            size = self.size(for: current)
++        }
++        let frame = geometry.screenFrame
++        return NSRect(
++            x: frame.midX - size.width / 2,
++            y: frame.maxY - size.height,
++            width: size.width,
++            height: size.height
++        ).insetBy(dx: -3, dy: -3)
++    }
++}
++
++// MARK: - Window
++
++final class NotchIslandPanel: NSPanel {
++    /// Only the assistant panel has a text field; otherwise the island never takes key focus,
++    /// so the app you are dictating into keeps it.
++    var allowsKey = false
++
++    override var canBecomeKey: Bool { allowsKey }
++    override var canBecomeMain: Bool { false }
++
++    init(contentRect: NSRect) {
++        super.init(
++            contentRect: contentRect,
++            styleMask: [.borderless, .nonactivatingPanel],
++            backing: .buffered,
++            defer: false
++        )
++        isFloatingPanel = true
++        level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 3)
++        backgroundColor = .clear
++        isOpaque = false
++        hasShadow = false
++        hidesOnDeactivate = false
++        canHide = false
++        isMovable = false
++        isMovableByWindowBackground = false
++        ignoresMouseEvents = true
++        acceptsMouseMovedEvents = true
++        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
++        appearance = NSAppearance(named: .darkAqua)
++    }
++}
++
++final class NotchIslandHostingView<Content: View>: NSHostingView<Content> {
++    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
++}
++
++// MARK: - Controller
++
++/// Owns the always-present notch window: invisible behind the hardware notch while idle,
++/// a little larger and clickable on hover, larger and glowing while dictating.
++@MainActor
++final class NotchIslandController {
++    let model: NotchIslandModel
++
++    private let recorder: Recorder
++    private let assistantSession: AssistantSession
++    private let onTap: () -> Void
++    private let onClose: () -> Void
++    private let onAssistantFollowUp: (String) -> Void
++
++    private var panel: NotchIslandPanel?
++    private var eventMonitors: [Any] = []
++    private var hoverExitTask: Task<Void, Never>?
++    private var repositionTask: Task<Void, Never>?
++    private var cancellables = Set<AnyCancellable>()
++    private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "NotchIsland")
++
++    init(
++        engine: VoiceInkEngine,
++        recorder: Recorder,
++        onTap: @escaping () -> Void,
++        onClose: @escaping () -> Void,
++        onAssistantFollowUp: @escaping (String) -> Void
++    ) {
++        let screen = NotchIslandController.idleScreen()
++        self.model = NotchIslandModel(engine: engine, geometry: screen.map { NotchGeometry.make(for: $0) } ?? .fallback)
++        self.recorder = recorder
++        self.assistantSession = engine.assistantSession
++        self.onTap = onTap
++        self.onClose = onClose
++        self.onAssistantFollowUp = onAssistantFollowUp
++
++        // objectWillChange fires before the new value is stored; hop once so we read the result.
++        model.objectWillChange
++            .receive(on: DispatchQueue.main)
++            .sink { [weak self] _ in self?.modelDidChange() }
++            .store(in: &cancellables)
++    }
++
++    // MARK: Screens
++
++    /// The idle island lives on the display with the notch, or on the main display otherwise.
++    private static func idleScreen() -> NSScreen? {
++        NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? RecorderScreenResolver.resolve()
++    }
++
++    // MARK: Public API
++
++    /// Puts the idle island in place (call once the notch style is selected).
++    func showIdle() {
++        ensurePanel()
++        guard let screen = model.sessionActive ? RecorderScreenResolver.resolve() : NotchIslandController.idleScreen() else { return }
++        place(on: screen)
++        installEventMonitors()
++    }
++
++    /// A dictation started: move to the screen being worked on and expand.
++    @discardableResult
++    func beginSession() -> Bool {
++        guard let screen = RecorderScreenResolver.resolve() else {
++            logger.error("Notch island: no screen for session")
++            return false
++        }
++        repositionTask?.cancel()
++        ensurePanel()
++
++        if let app = NSWorkspace.shared.frontmostApplication,
++            app.bundleIdentifier != Bundle.main.bundleIdentifier
++        {
++            model.targetAppIcon = app.icon
++        } else {
++            model.targetAppIcon = nil
++        }
++
++        place(on: screen)
++        installEventMonitors()
++        model.sessionActive = true
++        return true
++    }
++
++    /// The dictation ended: collapse, then return to the notch display if it moved.
++    func endSession() {
++        model.sessionActive = false
++        repositionTask?.cancel()
++        repositionTask = Task { @MainActor [weak self] in
++            // Let the collapse animation finish before the window jumps screens.
++            try? await Task.sleep(nanoseconds: 600_000_000)
++            guard let self, !Task.isCancelled, !self.model.sessionActive else { return }
++            if let screen = NotchIslandController.idleScreen(),
++                NotchGeometry.make(for: screen) != self.model.geometry
++            {
++                self.place(on: screen)
++            }
++        }
++    }
++
++    /// Rebuilds the window, e.g. after sleep or a display change, when windows can go stale.
++    func refresh() {
++        destroyPanel()
++        showIdle()
++    }
++
++    func destroy() {
++        repositionTask?.cancel()
++        hoverExitTask?.cancel()
++        removeEventMonitors()
++        destroyPanel()
++    }
++
++    // MARK: Window
++
++    private func ensurePanel() {
++        guard panel == nil else { return }
++
++        let newPanel = NotchIslandPanel(contentRect: .zero)
++        let view = NotchIslandView(
++            model: model,
++            recorder: recorder,
++            assistantSession: assistantSession,
++            onTap: onTap,
++            onClose: onClose,
++            onAssistantFollowUp: onAssistantFollowUp
++        )
++        let hosting = NotchIslandHostingView(rootView: view)
++        hosting.sizingOptions = []
++        hosting.wantsLayer = true
++        hosting.layer?.backgroundColor = NSColor.clear.cgColor
++        newPanel.contentView = hosting
++        panel = newPanel
++    }
++
++    private func destroyPanel() {
++        panel?.orderOut(nil)
++        panel?.close()
++        panel = nil
++    }
++
++    private func place(on screen: NSScreen) {
++        let geometry = NotchGeometry.make(for: screen)
++        if geometry != model.geometry {
++            model.geometry = geometry
++        }
++
++        guard let panel else { return }
++        let size = model.windowSize
++        let frame = NSRect(
++            x: screen.frame.midX - size.width / 2,
++            y: screen.frame.maxY - size.height,
++            width: size.width,
++            height: size.height
++        )
++        panel.setFrame(frame, display: true)
++        panel.orderFrontRegardless()
++        updatePointerState()
++    }
++
++    // MARK: Pointer tracking
++
++    private func installEventMonitors() {
++        guard eventMonitors.isEmpty else { return }
++        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
++
++        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
++            Task { @MainActor [weak self] in self?.updatePointerState() }
++        }) {
++            eventMonitors.append(global)
++        }
++
++        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
++            Task { @MainActor [weak self] in self?.updatePointerState() }
++            return event
++        }) {
++            eventMonitors.append(local)
++        }
++    }
++
++    private func removeEventMonitors() {
++        for monitor in eventMonitors {
++            NSEvent.removeMonitor(monitor)
++        }
++        eventMonitors.removeAll()
++    }
++
++    /// The window is much larger than the island (room for every phase plus the glow), so it
++    /// lets clicks fall through to the menu bar unless the pointer is actually on the island.
++    private func updatePointerState() {
++        guard let panel else { return }
++        let inside = model.hitRect().contains(NSEvent.mouseLocation)
++
++        if panel.ignoresMouseEvents == inside {
++            panel.ignoresMouseEvents = !inside
++        }
++
++        if inside {
++            hoverExitTask?.cancel()
++            hoverExitTask = nil
++            if !model.isHovering {
++                model.isHovering = true
++            }
++        } else if model.isHovering, hoverExitTask == nil {
++            hoverExitTask = Task { @MainActor [weak self] in
++                try? await Task.sleep(nanoseconds: 150_000_000)
++                guard let self, !Task.isCancelled else { return }
++                self.hoverExitTask = nil
++                if !self.model.hitRect().contains(NSEvent.mouseLocation) {
++                    self.model.isHovering = false
++                }
++            }
++        }
++    }
++
++    private func modelDidChange() {
++        guard let panel else { return }
++        let wantsKey = model.phase == .assistant
++        if panel.allowsKey != wantsKey {
++            panel.allowsKey = wantsKey
++        }
++        updatePointerState()
++    }
++}
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+new file mode 100644
+index 0000000..1c48b26
+--- /dev/null
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -0,0 +1,295 @@
++import SwiftUI
++
++/// Dynamic-Island style notch: hidden behind the hardware notch while idle, a little larger on
++/// hover, larger and glowing (Spokenly-style rim light) while dictating.
++struct NotchIslandView: View {
++    @ObservedObject var model: NotchIslandModel
++    let recorder: Recorder
++    @ObservedObject var assistantSession: AssistantSession
++    let onTap: () -> Void
++    let onClose: () -> Void
++    let onAssistantFollowUp: (String) -> Void
++
++    @AppStorage(RecorderDisplaySettingsKeys.showLiveTranscript) private var showLiveTranscript = true
++
++    private let morph = Animation.spring(response: 0.38, dampingFraction: 0.80)
++
++    var body: some View {
++        let phase = model.phase
++        let size = model.size(for: phase)
++
++        island(phase: phase, size: size)
++            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
++            .animation(morph, value: phase)
++            .animation(morph, value: model.geometry)
++    }
++
++    // MARK: - Island
++
++    private func island(phase: NotchIslandPhase, size: CGSize) -> some View {
++        let shape = Self.shape(for: phase)
++
++        return VStack(spacing: 0) {
++            mainRow(phase: phase, size: size, topRadius: shape.topCornerRadius)
++            liveTextPanel(phase: phase)
++            assistantPanel(phase: phase)
++        }
++        .frame(width: size.width, height: size.height, alignment: .top)
++        .background(Color.black)
++        .clipShape(shape)
++        .overlay {
++            rim(phase: phase, shape: shape)
++        }
++        .background {
++            NotchIslandGlow(phase: phase, shape: shape, meter: { recorder.audioMeterSnapshot() })
++        }
++        .opacity(phase == .hidden ? 0 : 1)
++    }
++
++    private static func shape(for phase: NotchIslandPhase) -> NotchShape {
++        switch phase {
++        case .hidden, .idle:
++            return NotchShape(topCornerRadius: 4, bottomCornerRadius: 8)
++        case .hover:
++            return NotchShape(topCornerRadius: 6, bottomCornerRadius: 12)
++        case .recording, .processing:
++            return NotchShape(topCornerRadius: 8, bottomCornerRadius: 14)
++        case .liveText, .assistant:
++            return NotchShape(topCornerRadius: 12, bottomCornerRadius: 22)
++        }
++    }
++
++    @ViewBuilder
++    private func rim(phase: NotchIslandPhase, shape: NotchShape) -> some View {
++        switch phase {
++        case .recording, .liveText:
++            shape.stroke(NotchIslandGlow.recordingColor.opacity(0.65), lineWidth: 1)
++        case .processing:
++            shape.stroke(NotchIslandGlow.processingColor.opacity(0.5), lineWidth: 1)
++        default:
++            EmptyView()
++        }
++    }
++
++    // MARK: - Main row (the part beside the hardware notch)
++
++    private func mainRow(phase: NotchIslandPhase, size: CGSize, topRadius: CGFloat) -> some View {
++        let wing = max(0, (size.width - model.geometry.notchWidth) / 2)
++        let rowHeight = model.rowHeight
++
++        return HStack(spacing: 0) {
++            leftWing(phase: phase)
++                .padding(.leading, topRadius)
++                .frame(width: wing, height: rowHeight)
++            Spacer(minLength: 0)
++            rightWing(phase: phase, rowHeight: rowHeight)
++                .padding(.trailing, topRadius)
++                .frame(width: wing, height: rowHeight)
++        }
++        .frame(width: size.width, height: rowHeight)
++        .clipped()
++        .contentShape(Rectangle())
++        .onTapGesture {
++            switch phase {
++            case .hidden, .idle, .hover, .recording, .liveText:
++                onTap()
++            case .processing, .assistant:
++                break
++            }
++        }
++    }
++
++    @ViewBuilder
++    private func leftWing(phase: NotchIslandPhase) -> some View {
++        Group {
++            switch phase {
++            case .hover:
++                Image(systemName: "mic.fill")
++                    .font(.system(size: 11, weight: .semibold))
++                    .foregroundStyle(Color.white.opacity(0.9))
++            case .recording, .liveText, .processing:
++                targetAppBadge(phase: phase)
++            case .assistant:
++                if model.recordingState == .idle && !assistantSession.isBusy {
++                    RecorderCloseButton(action: onClose)
++                } else {
++                    targetAppBadge(phase: phase)
++                }
++            case .hidden, .idle:
++                Color.clear
++            }
++        }
++        .transition(.opacity)
++        .animation(.easeOut(duration: 0.18).delay(0.06), value: phase)
++    }
++
++    @ViewBuilder
++    private func targetAppBadge(phase: NotchIslandPhase) -> some View {
++        if let icon = model.targetAppIcon {
++            Image(nsImage: icon)
++                .resizable()
++                .interpolation(.high)
++                .frame(width: 18, height: 18)
++        } else {
++            Circle()
++                .fill(phase == .processing ? NotchIslandGlow.processingColor : NotchIslandGlow.recordingColor)
++                .frame(width: 7, height: 7)
++        }
++    }
++
++    @ViewBuilder
++    private func rightWing(phase: NotchIslandPhase, rowHeight: CGFloat) -> some View {
++        Group {
++            switch phase {
++            case .hover:
++                Image(systemName: "waveform")
++                    .font(.system(size: 10, weight: .semibold))
++                    .foregroundStyle(Color.white.opacity(0.55))
++            case .recording, .liveText:
++                NotchIslandWaveform(
++                    meter: { recorder.audioMeterSnapshot() },
++                    isActive: model.recordingState == .recording,
++                    maxHeight: max(8, min(18, rowHeight - 12))
++                )
++            case .processing:
++                NotchIslandProcessingDots()
++            case .assistant:
++                if assistantSession.isBusy || model.recordingState != .idle {
++                    NotchIslandProcessingDots()
++                } else {
++                    Color.clear
++                }
++            case .hidden, .idle:
++                Color.clear
++            }
++        }
++        .transition(.opacity)
++        .animation(.easeOut(duration: 0.18).delay(0.06), value: phase)
++    }
++
++    // MARK: - Panels below the notch
++
++    @ViewBuilder
++    private func liveTextPanel(phase: NotchIslandPhase) -> some View {
++        if phase == .liveText {
++            VStack(spacing: 0) {
++                Divider().background(Color.white.opacity(0.15))
++                LiveTranscriptView(text: model.partialTranscript)
++                    .padding(.horizontal, 8)
++            }
++            .frame(height: NotchIslandModel.liveTextPanelHeight)
++            .clipped()
++            .transition(.opacity)
++        }
++    }
++
++    @ViewBuilder
++    private func assistantPanel(phase: NotchIslandPhase) -> some View {
++        if phase == .assistant {
++            VStack(spacing: 0) {
++                Divider().background(Color.white.opacity(0.15))
++                AssistantPanelView(
++                    session: assistantSession,
++                    liveFollowUpText: showLiveTranscript && model.recordingState == .recording
++                        ? model.partialTranscript : "",
++                    onSend: onAssistantFollowUp
++                )
++            }
++            .frame(height: NotchIslandModel.assistantPanelHeight)
++            .clipped()
++            .transition(.opacity)
++        }
++    }
++}
++
++// MARK: - Glow
++
++struct NotchIslandGlow: View {
++    static let recordingColor = Color(red: 1.0, green: 0.30, blue: 0.36)
++    static let processingColor = Color(red: 0.62, green: 0.46, blue: 1.0)
++
++    let phase: NotchIslandPhase
++    let shape: NotchShape
++    let meter: () -> AudioMeter
++
++    var body: some View {
++        switch phase {
++        case .recording, .liveText:
++            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { _ in
++                let level = CGFloat(max(0, min(1, pow(meter().averagePower, 0.7))))
++                glow(color: Self.recordingColor, strength: 0.55 + 0.4 * level, radius: 9 + 10 * level)
++            }
++        case .processing:
++            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
++                let time = context.date.timeIntervalSinceReferenceDate
++                let pulse = CGFloat((sin(time * 3.2) + 1) / 2)
++                glow(color: Self.processingColor, strength: 0.38 + 0.3 * pulse, radius: 8 + 5 * pulse)
++            }
++        case .hover:
++            glow(color: .white, strength: 0.16, radius: 8)
++        case .hidden, .idle, .assistant:
++            Color.clear
++        }
++    }
++
++    private func glow(color: Color, strength: CGFloat, radius: CGFloat) -> some View {
++        shape
++            .fill(Color.black)
++            .shadow(color: color.opacity(strength), radius: radius * 0.5)
++            .shadow(color: color.opacity(strength * 0.6), radius: radius * 1.4)
++    }
++}
++
++// MARK: - Waveform
++
++struct NotchIslandWaveform: View {
++    let meter: () -> AudioMeter
++    let isActive: Bool
++    let maxHeight: CGFloat
++
++    private let barCount = 5
++    private let barWidth: CGFloat = 3
++    private let minHeight: CGFloat = 3
++
++    var body: some View {
++        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
++            let level = isActive ? max(0, min(1, pow(meter().averagePower, 0.7))) : 0
++            let time = context.date.timeIntervalSinceReferenceDate
++
++            HStack(spacing: 2.5) {
++                ForEach(0..<barCount, id: \.self) { index in
++                    Capsule()
++                        .fill(Color.white.opacity(0.92))
++                        .frame(width: barWidth, height: barHeight(index: index, level: level, time: time))
++                }
++            }
++        }
++    }
++
++    private func barHeight(index: Int, level: Double, time: TimeInterval) -> CGFloat {
++        let wave = (sin(time * 9 + Double(index) * 0.9) + 1) / 2
++        let middle = Double(barCount - 1) / 2
++        let centerBoost = 1 - abs(Double(index) - middle) / Double(barCount) * 0.8
++        let value = level * (0.35 + 0.65 * wave) * centerBoost
++        return minHeight + CGFloat(value) * (maxHeight - minHeight)
++    }
++}
++
++// MARK: - Processing dots
++
++struct NotchIslandProcessingDots: View {
++    var body: some View {
++        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
++            let time = context.date.timeIntervalSinceReferenceDate
++            HStack(spacing: 3.5) {
++                ForEach(0..<3, id: \.self) { index in
++                    let phase = (sin(time * 6 - Double(index) * 0.8) + 1) / 2
++                    Circle()
++                        .fill(Color.white)
++                        .frame(width: 4, height: 4)
++                        .opacity(0.3 + 0.7 * phase)
++                }
++            }
++        }
++    }
++}
+diff --git a/VoiceInk/NotchIsland.xcstrings b/VoiceInk/NotchIsland.xcstrings
+new file mode 100644
+index 0000000..d9e35d0
+--- /dev/null
++++ b/VoiceInk/NotchIsland.xcstrings
+@@ -0,0 +1,38 @@
++{
++  "sourceLanguage" : "en",
++  "strings" : {
++    "Four-Finger Tap to Dictate" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Mit vier Fingern tippen zum Diktieren"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Toucher avec quatre doigts pour dicter"
++          }
++        }
++      }
++    },
++    "Tap the trackpad with four fingers to start dictating. Tap again to stop and insert the text." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Tippe mit vier Fingern auf das Trackpad, um das Diktieren zu starten. Tippe erneut, um zu stoppen und den Text einzufügen."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Touchez le trackpad avec quatre doigts pour commencer la dictée. Touchez à nouveau pour arrêter et insérer le texte."
++          }
++        }
++      }
++    }
++  },
++  "version" : "1.0"
++}
