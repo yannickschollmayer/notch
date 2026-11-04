@@ -64,7 +64,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/VoiceInk-Dependencies/whisper.cpp/build-apple
-          key: whisper-xcframework-${{ runner.os }}-v1
+          key: whisper-xcframework-b5454
 
       - name: Prepare whisper.xcframework
         run: |
@@ -76,7 +76,7 @@ jobs:
             exit 0
           fi
           mkdir -p "$DEST" "$RUNNER_TEMP/whisper"
-          gh release download --repo ggml-org/whisper.cpp --pattern '*xcframework*.zip' --dir "$RUNNER_TEMP/whisper"
+          gh release download b5454 --repo ggml-org/whisper.cpp --pattern 'whisper-*-xcframework.zip' --dir "$RUNNER_TEMP/whisper"
           unzip -q "$RUNNER_TEMP"/whisper/*.zip -d "$RUNNER_TEMP/whisper/x"
           FW=$(find "$RUNNER_TEMP/whisper/x" -type d -name whisper.xcframework | head -1)
           cp -R "$FW" "$DEST/"
