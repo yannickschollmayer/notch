@@ -1,0 +1,267 @@
+diff --git a/VoiceInk/Features/Shortcuts/Coordination/FourFingerTapMonitor.swift b/VoiceInk/Features/Shortcuts/Coordination/FourFingerTapMonitor.swift
+new file mode 100644
+index 0000000..32b824d
+--- /dev/null
++++ b/VoiceInk/Features/Shortcuts/Coordination/FourFingerTapMonitor.swift
+@@ -0,0 +1,261 @@
++import AppKit
++import Foundation
++import os
++
++/// Recognises a quick four-finger tap on the built-in trackpad or a Magic Trackpad.
++///
++/// macOS has no public API for raw trackpad touches, so the touches are read from the private
++/// MultitouchSupport framework, the same approach used by MiddleClick, BetterTouchTool and
++/// Spokenly. All symbols are resolved at runtime with dlopen/dlsym: if the framework ever
++/// disappears or changes, the feature turns itself off instead of crashing the app.
++///
++/// A tap is: exactly four fingers on the pad at the same time, all lifted again within
++/// maxTapDuration, and no finger travelling further than maxTravel. Swipes (Mission Control,
++/// Spaces), pinches (Launchpad) and resting the hand on the pad never qualify.
++final class FourFingerTapMonitor: @unchecked Sendable {
++    static let shared = FourFingerTapMonitor()
++    static let enabledKey = "FourFingerTapEnabled"
++
++    /// Called on the main thread for every recognised tap.
++    var onTap: (@MainActor () -> Void)?
++
++    // MARK: - Recognition thresholds
++
++    private let requiredFingers = 4
++    /// Seconds between the first finger touching and the last finger lifting.
++    private let maxTapDuration: Double = 0.35
++    /// Largest distance any finger may move, in normalised trackpad units (0...1).
++    private let maxTravel: Float = 0.05
++    /// Ignore a second tap that follows the previous one this quickly (seconds).
++    private let cooldown: Double = 0.45
++
++    // MARK: - MultitouchSupport
++
++    private typealias DeviceRef = UnsafeMutableRawPointer
++    private typealias ContactCallback = @convention(c) (
++        UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int32, Double, Int32
++    ) -> Int32
++    private typealias CreateListFn = @convention(c) () -> UnsafeMutableRawPointer?
++    private typealias RegisterFn = @convention(c) (UnsafeMutableRawPointer?, ContactCallback?) -> Void
++    private typealias StartFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32
++    private typealias StopFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
++
++    private struct API {
++        let createList: CreateListFn
++        let register: RegisterFn
++        let unregister: RegisterFn
++        let start: StartFn
++        let stop: StopFn
++    }
++
++    /// Byte layout of one MTTouch record (64-bit): frame(Int32) + padding, timestamp(Double),
++    /// identifier(Int32) at 16, state(Int32) at 20, finger/hand IDs, normalised position
++    /// (Float x at 32, Float y at 36), … — 96 bytes per touch.
++    private static let touchStride = 96
++    private static let identifierOffset = 16
++    private static let stateOffset = 20
++    private static let positionXOffset = 32
++    private static let positionYOffset = 36
++    /// MTTouchState: 3 = making touch, 4 = touching.
++    private static let touchingStates: Set<Int32> = [3, 4]
++
++    private static let callback: ContactCallback = { device, touches, count, timestamp, _ in
++        FourFingerTapMonitor.shared.handleFrame(
++            device: device, touches: touches, count: Int(count), timestamp: timestamp)
++        return 0
++    }
++
++    // MARK: - State
++
++    private struct Gesture {
++        var isActive = false
++        var startTime: Double = 0
++        var maxFingers = 0
++        var origins: [Int32: SIMD2<Float>] = [:]
++        var travel: Float = 0
++    }
++
++    private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "FourFingerTap")
++    private let lock = NSLock()
++    private var gestures: [UInt: Gesture] = [:]
++    private var lastTapTime: Double = 0
++
++    // Only touched on the main thread.
++    private var api: API?
++    private var apiUnavailable = false
++    private var devices: CFArray?
++    private var isRunning = false
++    private var wakeObserver: NSObjectProtocol?
++
++    private init() {
++        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
++            forName: NSWorkspace.didWakeNotification,
++            object: nil,
++            queue: .main
++        ) { [weak self] _ in
++            // Devices are invalid after sleep; give the hardware a moment, then re-register.
++            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
++                self?.restartIfRunning()
++            }
++        }
++    }
++
++    // MARK: - Public control (main thread)
++
++    static var isEnabledInSettings: Bool {
++        UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
++    }
++
++    func applyStoredPreference() {
++        setEnabled(Self.isEnabledInSettings)
++    }
++
++    func setEnabled(_ enabled: Bool) {
++        if enabled {
++            start()
++        } else {
++            stop()
++        }
++    }
++
++    /// Re-scans for trackpads, e.g. after a Magic Trackpad was connected.
++    func restartIfRunning() {
++        guard isRunning else { return }
++        stop()
++        start()
++    }
++
++    private func start() {
++        guard !isRunning, let api = loadAPI() else { return }
++        guard let rawList = api.createList() else {
++            logger.error("MTDeviceCreateList returned nil")
++            return
++        }
++        let list = Unmanaged<CFArray>.fromOpaque(UnsafeRawPointer(rawList)).takeRetainedValue()
++        let count = CFArrayGetCount(list)
++        for index in 0..<count {
++            guard let device = CFArrayGetValueAtIndex(list, index) else { continue }
++            let ref = UnsafeMutableRawPointer(mutating: device)
++            api.register(ref, Self.callback)
++            _ = api.start(ref, 0)
++        }
++        devices = list
++        isRunning = true
++        logger.notice("Four-finger tap monitor started devices=\(count, privacy: .public)")
++    }
++
++    private func stop() {
++        guard isRunning else { return }
++        if let api, let devices {
++            let count = CFArrayGetCount(devices)
++            for index in 0..<count {
++                guard let device = CFArrayGetValueAtIndex(devices, index) else { continue }
++                let ref = UnsafeMutableRawPointer(mutating: device)
++                api.unregister(ref, Self.callback)
++                _ = api.stop(ref)
++            }
++        }
++        devices = nil
++        isRunning = false
++        lock.lock()
++        gestures.removeAll()
++        lock.unlock()
++        logger.notice("Four-finger tap monitor stopped")
++    }
++
++    private func loadAPI() -> API? {
++        if let api { return api }
++        if apiUnavailable { return nil }
++
++        let path = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
++        guard let handle = dlopen(path, RTLD_NOW) else {
++            apiUnavailable = true
++            logger.error("MultitouchSupport not available")
++            return nil
++        }
++
++        func symbol<T>(_ name: String, as type: T.Type) -> T? {
++            guard let pointer = dlsym(handle, name) else { return nil }
++            return unsafeBitCast(pointer, to: type)
++        }
++
++        guard
++            let createList = symbol("MTDeviceCreateList", as: CreateListFn.self),
++            let register = symbol("MTRegisterContactFrameCallback", as: RegisterFn.self),
++            let unregister = symbol("MTUnregisterContactFrameCallback", as: RegisterFn.self),
++            let start = symbol("MTDeviceStart", as: StartFn.self),
++            let stop = symbol("MTDeviceStop", as: StopFn.self)
++        else {
++            apiUnavailable = true
++            logger.error("MultitouchSupport symbols missing")
++            return nil
++        }
++
++        let api = API(createList: createList, register: register, unregister: unregister, start: start, stop: stop)
++        self.api = api
++        return api
++    }
++
++    // MARK: - Recognition (MultitouchSupport thread)
++
++    private func handleFrame(device: UnsafeMutableRawPointer?, touches: UnsafeMutableRawPointer?, count: Int, timestamp: Double) {
++        var down: [(id: Int32, position: SIMD2<Float>)] = []
++        if let touches, count > 0 {
++            down.reserveCapacity(count)
++            for index in 0..<count {
++                let base = touches + index * Self.touchStride
++                let state = base.load(fromByteOffset: Self.stateOffset, as: Int32.self)
++                guard Self.touchingStates.contains(state) else { continue }
++                let id = base.load(fromByteOffset: Self.identifierOffset, as: Int32.self)
++                let x = base.load(fromByteOffset: Self.positionXOffset, as: Float.self)
++                let y = base.load(fromByteOffset: Self.positionYOffset, as: Float.self)
++                down.append((id: id, position: SIMD2(x, y)))
++            }
++        }
++
++        let key = UInt(bitPattern: device)
++        var shouldFire = false
++
++        lock.lock()
++        var gesture = gestures[key] ?? Gesture()
++        if !down.isEmpty {
++            if !gesture.isActive {
++                gesture = Gesture()
++                gesture.isActive = true
++                gesture.startTime = timestamp
++            }
++            gesture.maxFingers = max(gesture.maxFingers, down.count)
++            for touch in down {
++                if let origin = gesture.origins[touch.id] {
++                    let delta = touch.position - origin
++                    let distance = (delta.x * delta.x + delta.y * delta.y).squareRoot()
++                    gesture.travel = max(gesture.travel, distance)
++                } else {
++                    gesture.origins[touch.id] = touch.position
++                }
++            }
++        } else if gesture.isActive {
++            let duration = timestamp - gesture.startTime
++            if gesture.maxFingers == requiredFingers,
++                duration <= maxTapDuration,
++                gesture.travel <= maxTravel,
++                timestamp - lastTapTime >= cooldown
++            {
++                lastTapTime = timestamp
++                shouldFire = true
++            }
++            gesture = Gesture()
++        }
++        gestures[key] = gesture
++        lock.unlock()
++
++        if shouldFire {
++            DispatchQueue.main.async { [weak self] in
++                guard let self else { return }
++                MainActor.assumeIsolated {
++                    self.onTap?()
++                }
++            }
++        }
++    }
++}
