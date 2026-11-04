@@ -1,0 +1,124 @@
+name: Build VoiceInk Notch
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      LOG: ${{ github.workspace }}/build.log
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Report start
+        run: bash fork/ci/report.sh running
+
+      - name: Fetch upstream VoiceInk and apply patches
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$LOG") 2>&1
+          SHA=$(tr -d '[:space:]' < fork/UPSTREAM)
+          git clone -q https://github.com/Beingpax/VoiceInk.git src
+          cd src
+          git checkout -q "$SHA"
+          for p in $(ls ../fork/patches/*.patch | sort); do
+            echo "Applying $(basename "$p")"
+            git apply --whitespace=nowarn "$p" || { echo "Patch failed: $p"; exit 1; }
+          done
+          git status --short
+
+      - name: Select Xcode
+        run: |
+          set -uo pipefail
+          exec > >(tee -a "$LOG") 2>&1
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -vi beta | python3 -c "
+          import re, sys
+          apps = [l.strip() for l in sys.stdin if l.strip()]
+          key = lambda s: [int(n) for n in re.findall(r'\d+', s.rsplit('/', 1)[-1])]
+          print(max(apps, key=key) if apps else '')
+          ") || XCODE=""
+          if [ -n "$XCODE" ]; then
+            echo "Using $XCODE"
+            sudo xcode-select -s "$XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain || echo "Metal toolchain download skipped"
+
+      - name: Cache whisper.xcframework
+        uses: actions/cache@v4
+        with:
+          path: ~/VoiceInk-Dependencies/whisper.cpp/build-apple
+          key: whisper-xcframework-${{ runner.os }}-v1
+
+      - name: Prepare whisper.xcframework
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$LOG") 2>&1
+          DEST="$HOME/VoiceInk-Dependencies/whisper.cpp/build-apple"
+          if [ -d "$DEST/whisper.xcframework" ]; then
+            echo "whisper.xcframework from cache"
+            exit 0
+          fi
+          mkdir -p "$DEST" "$RUNNER_TEMP/whisper"
+          gh release download --repo ggml-org/whisper.cpp --pattern '*xcframework*.zip' --dir "$RUNNER_TEMP/whisper"
+          unzip -q "$RUNNER_TEMP"/whisper/*.zip -d "$RUNNER_TEMP/whisper/x"
+          FW=$(find "$RUNNER_TEMP/whisper/x" -type d -name whisper.xcframework | head -1)
+          cp -R "$FW" "$DEST/"
+          ls "$DEST/whisper.xcframework"
+
+      - name: Build (make local, ad-hoc signed)
+        working-directory: src
+        run: |
+          set -uo pipefail
+          echo "Building... (full log goes to build.log)"
+          if ! make local LOCAL_CODESIGN_IDENTITY=- >> "$LOG" 2>&1; then
+            grep -E "error:" "$LOG" | head -80
+            exit 1
+          fi
+          grep -E "\*\* BUILD|Build complete" "$LOG" | tail -5
+          test -d "$HOME/Downloads/VoiceInk.app"
+
+      - name: Re-sign with a stable requirement and package
+        run: |
+          set -uo pipefail
+          exec > >(tee -a "$LOG") 2>&1
+          APP="$HOME/Downloads/VoiceInk.app"
+          # Designated requirement = bundle identifier, so macOS keeps microphone/accessibility
+          # permissions across updates instead of asking again after every build.
+          codesign --force --sign - --preserve-metadata=entitlements,flags,runtime \
+            --requirements '=designated => identifier "com.prakashjoshipax.VoiceInk"' "$APP"
+          codesign --verify --verbose=2 "$APP" || echo "codesign verify reported a problem"
+          codesign -d -r- "$APP" || true
+          cd "$HOME/Downloads"
+          ditto -c -k --sequesterRsrc --keepParent VoiceInk.app "$GITHUB_WORKSPACE/VoiceInk-Notch.zip"
+          ls -la "$GITHUB_WORKSPACE/VoiceInk-Notch.zip"
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$LOG") 2>&1
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest "$GITHUB_WORKSPACE/VoiceInk-Notch.zip" \
+            --target "$GITHUB_SHA" \
+            --title "VoiceInk Notch (Build $GITHUB_RUN_NUMBER)" \
+            --notes "Automatisch gebaut aus VoiceInk $(cut -c1-7 fork/UPSTREAM) mit den Patches aus diesem Repo. Installation: siehe README."
+
+      - name: Report result
+        if: always()
+        run: bash fork/ci/report.sh "${{ job.status }}"
