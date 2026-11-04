@@ -99,6 +99,11 @@ jobs:
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
           export GIT_TERMINAL_PROMPT=0
           xcodebuild -version
+          ( while true; do
+              sleep 60
+              echo "--- $(date +%H:%M:%S) busy processes:"
+              ps -Ao pid,etime,%cpu,command | grep -E 'git|swift|curl|xcodebuild|lfs|ssh|clang|unzip|ditto' | grep -v grep | cut -c1-230 | head -25
+            done ) &
           perl -e 'alarm shift; exec @ARGV' 1500 xcodebuild -resolvePackageDependencies \
             -project VoiceInk.xcodeproj -scheme VoiceInk \
             -derivedDataPath "$GITHUB_WORKSPACE/dd" -scmProvider system 2>&1 | tee -a "$LOG"
