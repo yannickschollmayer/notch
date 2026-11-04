@@ -99,12 +99,20 @@ jobs:
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
           export GIT_TERMINAL_PROMPT=0
           xcodebuild -version
-          ( while true; do
-              sleep 60
-              echo "--- $(date +%H:%M:%S) busy processes:"
-              ps -Ao pid,etime,%cpu,command | grep -E 'git|swift|curl|xcodebuild|lfs|ssh|clang|unzip|ditto' | grep -v grep | cut -c1-230 | head -25
+          ( sleep 90
+            while true; do
+              P=$(pgrep -f 'xcodebuild -resolvePackageDependencies' | head -1)
+              echo "--- $(date +%H:%M:%S) pid=$P"
+              ps -Ao pid,ppid,etime,%cpu,command | grep -E 'git|swift|curl|xcodebuild|lfs|ssh|clang|unzip|security|Agent' | grep -v grep | cut -c1-200 | head -20
+              if [ -n "$P" ]; then
+                echo "  network:"
+                sudo lsof -nP -a -p "$P" -i 2>/dev/null | head -15
+                echo "  stack (most frequent frames):"
+                sudo sample "$P" 2 -mayDie 2>/dev/null | grep -E 'DVT|IDE|SwiftPM|PackageGraph|URLSession|Download|[Ll]ock|[Ss]emaphore|Keychain|Sec[A-Z][a-z]|Artifact|Prebuilt|Manifest|Fetch|wait' | sed -E 's/^[ +!:|]*//; s/ +\(in .*//; s/  +/ /g' | sort | uniq -c | sort -rn | head -40
+              fi
+              sleep 120
             done ) &
-          perl -e 'alarm shift; exec @ARGV' 1500 xcodebuild -resolvePackageDependencies \
+          perl -e 'alarm shift; exec @ARGV' 900 xcodebuild -resolvePackageDependencies \
             -project VoiceInk.xcodeproj -scheme VoiceInk \
             -derivedDataPath "$GITHUB_WORKSPACE/dd" -scmProvider system 2>&1 | tee -a "$LOG"
 
