@@ -90,6 +90,19 @@ jobs:
           restore-keys: |
             dd-${{ hashFiles('fork/UPSTREAM') }}-
 
+      - name: Resolve Swift packages
+        working-directory: src
+        run: |
+          set -uo pipefail
+          defaults write com.apple.dt.Xcode IDEPackageEnablePrebuilts -bool NO
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+          export GIT_TERMINAL_PROMPT=0
+          xcodebuild -version
+          perl -e 'alarm shift; exec @ARGV' 1500 xcodebuild -resolvePackageDependencies \
+            -project VoiceInk.xcodeproj -scheme VoiceInk \
+            -derivedDataPath "$GITHUB_WORKSPACE/dd" -scmProvider system 2>&1 | tee -a "$LOG"
+
       - name: Build (ad-hoc signed, like make local)
         working-directory: src
         run: |
@@ -102,11 +115,13 @@ jobs:
             CODE_SIGN_ENTITLEMENTS="$PWD/VoiceInk/VoiceInk.local.entitlements" \
             SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) LOCAL_BUILD' \
             -skipPackagePluginValidation -skipMacroValidation \
+            -scmProvider system -disableAutomaticPackageResolution \
             build >> "$LOG" 2>&1 &
           PID=$!
           while kill -0 "$PID" 2>/dev/null; do
             sleep 120
             echo "$(date +%H:%M) compiled=$(grep -cE '^(CompileSwift|CompileC|CompileMetalFile|SwiftCompile) ' "$LOG") last: $(grep -E '^(CompileSwift|CompileC|CompileMetalFile|SwiftCompile|Ld|ProcessProduct) ' "$LOG" | tail -1 | cut -c1-160)"
+            echo "      tail: $(tail -n 1 "$LOG" | cut -c1-200)"
             bash "$GITHUB_WORKSPACE/fork/ci/report.sh" building > /dev/null 2>&1 || true
           done
           RC=0
