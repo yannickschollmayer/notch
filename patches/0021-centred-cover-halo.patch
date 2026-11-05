@@ -1,0 +1,119 @@
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 3c79236..980dc17 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -920,5 +920,4 @@ struct NotchPlayerPanel: View {
+ 
+-    /// Light in the cover's own colours shining out from behind it in several directions: never
+-    /// up towards the notch and only a little past the cover's right edge. Stronger while the song
+-    /// plays.
++    /// Light in the cover's own colours right behind it, reaching only a little past its edges.
++    /// Not up into the top row: light there would show the real notch through the island.
+     @ViewBuilder
+@@ -926,3 +925,3 @@ struct NotchPlayerPanel: View {
+         if nowPlaying.artwork != nil {
+-            let reach: CGFloat = 60
++            let reach: CGFloat = 30
+             let side: CGFloat = 58 + reach * 2
+@@ -933,4 +932,4 @@ struct NotchPlayerPanel: View {
+                         stops: [
+-                            .init(color: .clear, location: (reach - 4) / side),
+-                            .init(color: .white, location: (reach + 14) / side),
++                            .init(color: .clear, location: (reach - 9) / side),
++                            .init(color: .white, location: (reach + 3) / side),
+                         ],
+@@ -940,13 +939,3 @@ struct NotchPlayerPanel: View {
+                 }
+-                .mask {
+-                    LinearGradient(
+-                        stops: [
+-                            .init(color: .white, location: (reach + 58 + 4) / side),
+-                            .init(color: .clear, location: (reach + 58 + 22) / side),
+-                        ],
+-                        startPoint: .leading,
+-                        endPoint: .trailing
+-                    )
+-                }
+-                .opacity(isPlaying ? 0.9 : 0.4)
++                .opacity(isPlaying ? 0.9 : 0.45)
+                 .animation(.easeInOut(duration: 0.6), value: isPlaying)
+@@ -1087,4 +1076,4 @@ struct NotchMusicArtwork: View {
+ 
+-/// Soft beams of light in the given colours, running out from the centre in different directions
+-/// and slowly swaying while the song plays (still while paused).
++/// A soft round light behind the cover: its colours sit in different directions, brighter and
++/// dimmer in turn, and slowly turn while the song plays (still while paused).
+ struct NotchCoverGlow: View {
+@@ -1092,19 +1081,3 @@ struct NotchCoverGlow: View {
+     let isPlaying: Bool
+-
+-    private struct Beam {
+-        /// Degrees: 0 points right, 90 down.
+-        let angle: Double
+-        let length: CGFloat
+-        let width: CGFloat
+-        let color: Int
+-    }
+-
+-    private static let beams: [Beam] = [
+-        Beam(angle: 168, length: 92, width: 32, color: 0),
+-        Beam(angle: 100, length: 84, width: 36, color: 0),
+-        Beam(angle: 134, length: 104, width: 26, color: 1),
+-        Beam(angle: 50, length: 70, width: 26, color: 2),
+-        Beam(angle: 208, length: 72, width: 24, color: 1),
+-        Beam(angle: 76, length: 60, width: 22, color: 2),
+-    ]
++    var diameter: CGFloat = 84
+ 
+@@ -1113,32 +1086,22 @@ struct NotchCoverGlow: View {
+             let time = context.date.timeIntervalSinceReferenceDate
+-            ZStack {
+-                ForEach(Self.beams.indices, id: \.self) { index in
+-                    beam(Self.beams[index], index: index, time: time)
+-                }
+-            }
+-            .blur(radius: 11)
+-        }
+-    }
+-
+-    private func beam(_ beam: Beam, index: Int, time: Double) -> some View {
+-        let phase = Double(index) * 1.7
+-        let angle = beam.angle + 9 * sin(time * 0.35 + phase)
+-        let length = beam.length * (1 + 0.14 * sin(time * 0.6 + phase * 1.3))
+-        let color = colors.isEmpty ? Color.clear : colors[beam.color % colors.count]
+-        return Capsule()
+-            .fill(
+-                LinearGradient(
+-                    stops: [
+-                        .init(color: color, location: 0),
+-                        .init(color: color.opacity(0.75), location: 0.45),
+-                        .init(color: color.opacity(0), location: 1),
+-                    ],
+-                    startPoint: .leading,
+-                    endPoint: .trailing
+-                )
++            Circle()
++                .fill(AngularGradient(stops: stops, center: .center))
++                .frame(width: diameter, height: diameter)
++                // One turn in 24 seconds, breathing a little.
++                .rotationEffect(.degrees((time * 15).truncatingRemainder(dividingBy: 360)))
++                .scaleEffect(1 + 0.03 * sin(time * 1.3))
++                .blur(radius: 10)
++        }
++    }
++
++    private var stops: [Gradient.Stop] {
++        let count = 8
++        return (0...count).map { index in
++            let slot = index == count ? 0 : index
++            let color = colors.isEmpty ? Color.clear : colors[slot % colors.count]
++            return Gradient.Stop(
++                color: color.opacity(slot.isMultiple(of: 2) ? 1 : 0.4),
++                location: Double(index) / Double(count)
+             )
+-            .frame(width: length, height: beam.width)
+-            // Starts in the middle and runs outwards, turned around the middle.
+-            .offset(x: length / 2)
+-            .rotationEffect(.degrees(angle))
++        }
+     }
