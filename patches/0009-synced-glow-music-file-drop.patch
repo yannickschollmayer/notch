@@ -1,0 +1,2961 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift b/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+new file mode 100644
+index 0000000..3a608b0
+--- /dev/null
++++ b/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+@@ -0,0 +1,311 @@
++import AppKit
++import UniformTypeIdentifiers
++import os
++
++/// What to do with files dropped on the notch.
++enum NotchDropAction {
++    case transcribe
++    case mp3
++    case airDrop
++}
++
++/// Files that are being dragged across the screen.
++struct NotchFileDrag: Equatable {
++    let urls: [URL]
++
++    var canTranscribe: Bool { urls.contains { SupportedMedia.isSupported(url: $0) } }
++    var canConvert: Bool { urls.contains { NotchFileActions.canConvertToMP3($0) } }
++}
++
++/// Progress or result of a drop action, shown in a card below the notch.
++struct NotchFileTask: Equatable {
++    enum Kind: Equatable {
++        case transcribe
++        case mp3
++    }
++
++    enum State: Equatable {
++        case working
++        case transcript(String)
++        case saved(URL)
++        case failed(String)
++    }
++
++    let id = UUID()
++    let kind: Kind
++    let fileName: String
++    var state: State
++
++    var isFinished: Bool {
++        if case .working = state { return false }
++        return true
++    }
++}
++
++/// Transcribe, convert to MP3 (like VideoLoader) or AirDrop the files dropped on the notch.
++@MainActor
++final class NotchFileActions {
++    private weak var engine: VoiceInkEngine?
++    private let model: NotchIslandModel
++    private var autoDismiss: Task<Void, Never>?
++    private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "NotchFileActions")
++
++    init(engine: VoiceInkEngine, model: NotchIslandModel) {
++        self.engine = engine
++        self.model = model
++    }
++
++    func perform(_ action: NotchDropAction, on urls: [URL]) {
++        let files = urls.filter(\.isFileURL)
++        guard !files.isEmpty else { return }
++        switch action {
++        case .transcribe:
++            transcribe(files.filter { SupportedMedia.isSupported(url: $0) })
++        case .mp3:
++            convert(files.filter { Self.canConvertToMP3($0) })
++        case .airDrop:
++            airDrop(files)
++        }
++    }
++
++    func dismiss() {
++        autoDismiss?.cancel()
++        autoDismiss = nil
++        model.fileTask = nil
++    }
++
++    /// Videos, and audio that is not an MP3 yet.
++    nonisolated static func canConvertToMP3(_ url: URL) -> Bool {
++        let fileExtension = url.pathExtension.lowercased()
++        guard fileExtension != "mp3" else { return false }
++        guard let type = UTType(filenameExtension: fileExtension) else {
++            return SupportedMedia.isSupported(url: url)
++        }
++        return type.conforms(to: .movie) || type.conforms(to: .audio)
++    }
++
++    // MARK: Transcribe
++
++    private func transcribe(_ files: [URL]) {
++        guard !files.isEmpty, let engine else { return }
++        var task = NotchFileTask(kind: .transcribe, fileName: Self.name(of: files), state: .working)
++
++        guard let mode = ModeManager.shared.currentEffectiveConfiguration else {
++            task.state = .failed(String(localized: "Choose a mode in VoiceInk first.", table: "NotchIsland"))
++            show(task)
++            return
++        }
++
++        let manager = AudioTranscriptionManager.shared
++        let known = Set(manager.queue.map(\.id))
++        manager.addToQueue(urls: files)
++        let items = manager.queue.filter { !known.contains($0.id) }
++        guard !items.isEmpty else {
++            task.state = .failed(String(localized: "These files are already being transcribed.", table: "NotchIsland"))
++            show(task)
++            return
++        }
++
++        show(task)
++        manager.startProcessing(modelContext: engine.modelContext, engine: engine, mode: mode)
++
++        let started = task
++        Task { @MainActor [weak self] in
++            var result = started
++            // Same queue as "Transcribe Audio" in VoiceInk, so the results also land in the history.
++            var idleChecks = 0
++            while items.contains(where: { !$0.status.isTerminal }) {
++                try? await Task.sleep(nanoseconds: 300_000_000)
++                // Stopped from elsewhere (e.g. cancelled in the main window).
++                if !manager.isProcessingQueue {
++                    idleChecks += 1
++                    if idleChecks > 6 { break }
++                } else {
++                    idleChecks = 0
++                }
++            }
++
++            var texts: [String] = []
++            var failure: String?
++            for item in items {
++                switch item.status {
++                case .completed:
++                    if let transcription = item.transcription {
++                        texts.append(Self.text(of: transcription))
++                    }
++                case .failed(let message):
++                    failure = message
++                case .pending, .processing:
++                    failure = String(localized: "Canceled", table: "NotchIsland")
++                }
++            }
++
++            guard let self else { return }
++            let text = texts.joined(separator: "\n\n")
++            if !text.isEmpty {
++                _ = ClipboardManager.copyToClipboard(text)
++                result.state = .transcript(text)
++            } else {
++                result.state = .failed(failure ?? String(localized: "Nothing was recognized.", table: "NotchIsland"))
++            }
++            self.show(result)
++        }
++    }
++
++    /// The AI-cleaned text when that worked, the plain transcript otherwise.
++    private static func text(of transcription: Transcription) -> String {
++        if let enhanced = transcription.enhancedText, !enhanced.isEmpty, transcription.enhancementDuration != nil {
++            return enhanced
++        }
++        return transcription.text
++    }
++
++    // MARK: MP3
++
++    private func convert(_ files: [URL]) {
++        guard !files.isEmpty else { return }
++        var task = NotchFileTask(kind: .mp3, fileName: Self.name(of: files), state: .working)
++        guard let ffmpeg = Self.ffmpegURL() else {
++            task.state = .failed(
++                String(localized: "ffmpeg was not found. Open VideoLoader once, or install ffmpeg with Homebrew.", table: "NotchIsland")
++            )
++            show(task)
++            return
++        }
++        show(task)
++
++        let started = task
++        Task { @MainActor [weak self] in
++            var result = started
++            var saved: [URL] = []
++            var failed = false
++            for file in files {
++                if let output = await Self.convertToMP3(file, ffmpeg: ffmpeg) {
++                    saved.append(output)
++                } else {
++                    failed = true
++                }
++            }
++
++            guard let self else { return }
++            if let last = saved.last {
++                result.state = .saved(last)
++            } else {
++                result.state = .failed(String(localized: "The file could not be converted.", table: "NotchIsland"))
++            }
++            if failed {
++                self.logger.error("Notch MP3: \(files.count - saved.count, privacy: .public) file(s) failed")
++            }
++            self.show(result)
++        }
++    }
++
++    /// The ffmpeg VideoLoader brings along, or one installed with Homebrew.
++    nonisolated private static func ffmpegURL() -> URL? {
++        let home = FileManager.default.homeDirectoryForCurrentUser
++        let candidates = [
++            home.appendingPathComponent("Library/Application Support/VideoLoader/bin/ffmpeg"),
++            URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
++            URL(fileURLWithPath: "/usr/local/bin/ffmpeg"),
++        ]
++        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
++    }
++
++    /// Same folder VideoLoader saves to.
++    nonisolated private static func outputFolder() -> URL {
++        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
++            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
++        return downloads.appendingPathComponent("VideoLoader", isDirectory: true)
++    }
++
++    nonisolated private static func convertToMP3(_ input: URL, ffmpeg: URL) async -> URL? {
++        let folder = outputFolder()
++        do {
++            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
++        } catch {
++            return nil
++        }
++        let base = input.deletingPathExtension().lastPathComponent
++        var output = folder.appendingPathComponent(base + ".mp3")
++        var counter = 2
++        while FileManager.default.fileExists(atPath: output.path) {
++            output = folder.appendingPathComponent(base + " " + String(counter) + ".mp3")
++            counter += 1
++        }
++        let target = output
++
++        let succeeded: Bool = await withCheckedContinuation { continuation in
++            let process = Process()
++            process.executableURL = ffmpeg
++            process.arguments = [
++                "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
++                "-i", input.path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", target.path,
++            ]
++            process.standardInput = FileHandle.nullDevice
++            process.standardOutput = FileHandle.nullDevice
++            process.standardError = FileHandle.nullDevice
++            process.terminationHandler = { finished in
++                let ok = finished.terminationStatus == 0
++                // The handler keeps the process alive until it ends; then let both go.
++                finished.terminationHandler = nil
++                withExtendedLifetime(process) {}
++                continuation.resume(returning: ok)
++            }
++            do {
++                try process.run()
++            } catch {
++                continuation.resume(returning: false)
++            }
++        }
++
++        if !succeeded {
++            try? FileManager.default.removeItem(at: target)
++            return nil
++        }
++        return target
++    }
++
++    // MARK: AirDrop
++
++    private func airDrop(_ files: [URL]) {
++        // Let the drag finish first, then bring up the AirDrop window.
++        Task { @MainActor [weak self] in
++            try? await Task.sleep(nanoseconds: 200_000_000)
++            guard let service = NSSharingService(named: .sendViaAirDrop), service.canPerform(withItems: files) else {
++                var task = NotchFileTask(kind: .mp3, fileName: Self.name(of: files), state: .working)
++                task.state = .failed(String(localized: "AirDrop is not available.", table: "NotchIsland"))
++                self?.show(task)
++                return
++            }
++            NSApp.activate()
++            service.perform(withItems: files)
++        }
++    }
++
++    // MARK: Card
++
++    private func show(_ task: NotchFileTask) {
++        model.fileTask = task
++        autoDismiss?.cancel()
++        autoDismiss = nil
++        guard task.isFinished else { return }
++
++        let id = task.id
++        autoDismiss = Task { @MainActor [weak self] in
++            try? await Task.sleep(nanoseconds: 9_000_000_000)
++            // Stays while the pointer is on it.
++            while let self, !Task.isCancelled, self.model.fileTask?.id == id {
++                if !self.model.isHovering {
++                    self.model.fileTask = nil
++                    return
++                }
++                try? await Task.sleep(nanoseconds: 1_000_000_000)
++            }
++        }
++    }
++
++    private static func name(of files: [URL]) -> String {
++        guard let first = files.first else { return "" }
++        return files.count > 1 ? first.lastPathComponent + " +" + String(files.count - 1) : first.lastPathComponent
++    }
++}
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index 7b93d8e..441af7d 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -80,11 +80,19 @@ enum NotchIslandPhase: Equatable {
+     case liveText
+     /// Assistant answer panel.
+     case assistant
++    /// Music is playing: cover on the left, moving bars on the right.
++    case music
++    /// A file is being dragged somewhere on the screen: a little larger, ready for the drop.
++    case dropReady
++    /// A file is dragged onto the notch: large, with the drop fields.
++    case dropTarget
++    /// Progress or result of a dropped file, in a card below.
++    case fileTask
+ 
+     var isActive: Bool {
+         switch self {
+         case .recording, .processing, .liveText, .assistant: return true
+-        case .hidden, .idle, .hover, .menu: return false
++        case .hidden, .idle, .hover, .menu, .music, .dropReady, .dropTarget, .fileTask: return false
+         }
+     }
+ 
+@@ -92,9 +100,13 @@ enum NotchIslandPhase: Equatable {
+     var showsScreenGlow: Bool {
+         switch self {
+         case .recording, .liveText, .processing: return true
+-        case .hidden, .idle, .hover, .menu, .assistant: return false
++        case .hidden, .idle, .hover, .menu, .assistant, .music, .dropReady, .dropTarget, .fileTask: return false
+         }
+     }
++
++    var isFileDrop: Bool {
++        self == .dropReady || self == .dropTarget
++    }
+ }
+ 
+ // MARK: - Model
+@@ -114,6 +126,13 @@ final class NotchIslandModel: ObservableObject {
+     /// so it can still be copied when the final transcription fails.
+     @Published private(set) var lastLiveText = ""
+     @Published private(set) var lastDictation: NotchLastDictation?
++    /// Spotify / Apple Music.
++    let nowPlaying: NotchNowPlaying
++    @Published private(set) var music: NotchNowPlaying.Track?
++    /// Files being dragged across the screen right now.
++    @Published var fileDrag: NotchFileDrag?
++    /// Card for a dropped file (working, done, failed).
++    @Published var fileTask: NotchFileTask?
+ 
+     private let modelContext: ModelContext
+     private var cancellables = Set<AnyCancellable>()
+@@ -125,11 +144,17 @@ final class NotchIslandModel: ObservableObject {
+     static let menuWing: CGFloat = 58
+     static let liveTextWing: CGFloat = 110
+     static let assistantWing: CGFloat = 230
++    static let musicWing: CGFloat = 46
++    static let dropReadyWing: CGFloat = 66
++    static let dropTargetWing: CGFloat = 130
+     static let rowBonus: CGFloat = 5
+     static let liveTextPanelHeight: CGFloat = 57
+     static let assistantPanelHeight: CGFloat = 320
++    static let dropPanelHeight: CGFloat = 86
+     /// Glass cards that drop down below the island.
+     static let menuCardSize = CGSize(width: 380, height: 150)
++    static let musicMenuCardSize = CGSize(width: 380, height: 222)
++    static let fileTaskCardSize = CGSize(width: 380, height: 96)
+     static let cardGap: CGFloat = 8
+     /// Room around the island for the glow.
+     static let glowPadding: CGFloat = 34
+@@ -137,6 +162,7 @@ final class NotchIslandModel: ObservableObject {
+     init(engine: VoiceInkEngine, geometry: NotchGeometry) {
+         self.geometry = geometry
+         self.modelContext = engine.modelContext
++        self.nowPlaying = NotchNowPlaying()
+ 
+         engine.$recordingState
+             .removeDuplicates()
+@@ -172,6 +198,11 @@ final class NotchIslandModel: ObservableObject {
+             .sink { [weak self] visible in self?.assistantVisible = visible }
+             .store(in: &cancellables)
+ 
++        nowPlaying.$track
++            .removeDuplicates()
++            .sink { [weak self] track in self?.music = track }
++            .store(in: &cancellables)
++
+         NotificationCenter.default.publisher(for: .transcriptionCompleted)
+             .merge(with: NotificationCenter.default.publisher(for: .transcriptionCreated))
+             .receive(on: DispatchQueue.main)
+@@ -230,8 +261,11 @@ final class NotchIslandModel: ObservableObject {
+             break
+         }
+ 
++        if fileDrag != nil { return isHovering ? .dropTarget : .dropReady }
+         if menuOpen { return .menu }
++        if fileTask != nil { return .fileTask }
+         if isHovering { return .hover }
++        if music?.isPlaying == true { return .music }
+         return geometry.hasNotch ? .idle : .hidden
+     }
+ 
+@@ -259,17 +293,24 @@ final class NotchIslandModel: ObservableObject {
+             return CGSize(width: width + Self.activeWing * 2, height: row)
+         case .liveText:
+             return CGSize(width: width + Self.liveTextWing * 2, height: row + Self.liveTextPanelHeight)
+-        case .menu:
++        case .menu, .fileTask:
+             return CGSize(width: width + Self.menuWing * 2, height: row)
+         case .assistant:
+             return CGSize(width: width + Self.assistantWing * 2, height: row + Self.assistantPanelHeight)
++        case .music:
++            return CGSize(width: width + Self.musicWing * 2, height: row)
++        case .dropReady:
++            return CGSize(width: width + Self.dropReadyWing * 2, height: row)
++        case .dropTarget:
++            return CGSize(width: width + Self.dropTargetWing * 2, height: row + Self.dropPanelHeight)
+         }
+     }
+ 
+     /// Glass card shown below the island in this phase.
+     func cardSize(for phase: NotchIslandPhase) -> CGSize? {
+         switch phase {
+-        case .menu: return Self.menuCardSize
++        case .menu: return music != nil ? Self.musicMenuCardSize : Self.menuCardSize
++        case .fileTask: return Self.fileTaskCardSize
+         default: return nil
+         }
+     }
+@@ -277,12 +318,16 @@ final class NotchIslandModel: ObservableObject {
+     /// Fixed size of the transparent window that hosts the island (and its cards) in every phase.
+     var windowSize: CGSize {
+         let assistant = size(for: .assistant)
++        let dropTarget = size(for: .dropTarget)
+         let island = size(for: .menu)
+-        let menuWidth = max(island.width, Self.menuCardSize.width)
+-        let menuHeight = island.height + Self.cardGap + Self.menuCardSize.height
++        let cards = [Self.menuCardSize, Self.musicMenuCardSize, Self.fileTaskCardSize]
++        let cardWidth = cards.map(\.width).max() ?? 0
++        let cardHeight = cards.map(\.height).max() ?? 0
++        let menuWidth = max(island.width, cardWidth)
++        let menuHeight = island.height + Self.cardGap + cardHeight
+         return CGSize(
+-            width: max(assistant.width, menuWidth) + Self.glowPadding * 2,
+-            height: max(assistant.height, menuHeight) + Self.glowPadding
++            width: max(assistant.width, dropTarget.width, menuWidth) + Self.glowPadding * 2,
++            height: max(assistant.height, dropTarget.height, menuHeight) + Self.glowPadding
+         )
+     }
+ 
+@@ -321,7 +366,9 @@ final class NotchIslandModel: ObservableObject {
+     /// Whether the pointer counts as "on the island": the island, its card, and the gap between.
+     func containsPointer(_ point: NSPoint) -> Bool {
+         let island = islandRect()
+-        if island.insetBy(dx: -3, dy: -3).contains(point) { return true }
++        // A little more room while dragging a file, so the drop target is easy to hit.
++        let margin: CGFloat = fileDrag != nil ? 18 : 3
++        if island.insetBy(dx: -margin, dy: -margin).contains(point) { return true }
+         guard let card = cardRect() else { return false }
+         if card.insetBy(dx: -3, dy: -3).contains(point) { return true }
+         let bridgeWidth = min(island.width, card.width)
+@@ -348,6 +395,7 @@ final class NotchIslandPanel: NSPanel {
+             defer: false
+         )
+         isFloatingPanel = true
++        isReleasedWhenClosed = false
+         level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 3)
+         backgroundColor = .clear
+         isOpaque = false
+@@ -384,7 +432,12 @@ final class NotchIslandController {
+ 
+     private var panel: NotchIslandPanel?
+     private let screenGlow: NotchScreenGlowWindow
++    private let fileActions: NotchFileActions
+     private var eventMonitors: [Any] = []
++    /// Change count of the drag pasteboard: it goes up when a new drag starts anywhere.
++    private var dragChangeCount = 0
++    private var dragTimer: Timer?
++    private var dragReleasedAt: Date?
+     private var hoverExitTask: Task<Void, Never>?
+     private var menuCloseTask: Task<Void, Never>?
+     private var repositionTask: Task<Void, Never>?
+@@ -399,7 +452,9 @@ final class NotchIslandController {
+         onAssistantFollowUp: @escaping (String) -> Void
+     ) {
+         let screen = NotchIslandController.idleScreen()
+-        self.model = NotchIslandModel(engine: engine, geometry: screen.map { NotchGeometry.make(for: $0) } ?? .fallback)
++        let model = NotchIslandModel(engine: engine, geometry: screen.map { NotchGeometry.make(for: $0) } ?? .fallback)
++        self.model = model
++        self.fileActions = NotchFileActions(engine: engine, model: model)
+         self.engine = engine
+         self.recorder = recorder
+         self.assistantSession = engine.assistantSession
+@@ -430,7 +485,8 @@ final class NotchIslandController {
+         guard let screen = model.sessionActive ? RecorderScreenResolver.resolve() : NotchIslandController.idleScreen() else { return }
+         place(on: screen)
+         installEventMonitors()
+-        screenGlow.prepare(for: screen, islands: [glowIsland(for: .recording), glowIsland(for: .liveText)])
++        NotchScreenGlowWindow.warmUp()
++        updateScreenGlow()
+     }
+ 
+     /// A dictation started: move to the screen being worked on and expand.
+@@ -484,6 +540,8 @@ final class NotchIslandController {
+         repositionTask?.cancel()
+         hoverExitTask?.cancel()
+         menuCloseTask?.cancel()
++        dragTimer?.invalidate()
++        dragTimer = nil
+         removeEventMonitors()
+         destroyPanel()
+         screenGlow.destroy()
+@@ -514,7 +572,9 @@ final class NotchIslandController {
+             onTap: onTap,
+             onClose: onClose,
+             onAssistantFollowUp: onAssistantFollowUp,
+-            onRetryLast: { [weak self] in self?.retryLastDictation() }
++            onRetryLast: { [weak self] in self?.retryLastDictation() },
++            onFileDrop: { [weak self] action in self?.handleDrop(action) },
++            onDismissFileTask: { [weak self] in self?.fileActions.dismiss() }
+         )
+         let hosting = NotchIslandHostingView(rootView: view)
+         hosting.sizingOptions = []
+@@ -557,15 +617,18 @@ final class NotchIslandController {
+     private func installEventMonitors() {
+         guard eventMonitors.isEmpty else { return }
+         let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
++        dragChangeCount = NSPasteboard(name: .drag).changeCount
+ 
+-        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
+-            Task { @MainActor [weak self] in self?.updatePointerState() }
++        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
++            let dragging = event.type == .leftMouseDragged
++            Task { @MainActor [weak self] in self?.pointerMoved(dragging: dragging) }
+         }) {
+             eventMonitors.append(global)
+         }
+ 
+         if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+-            Task { @MainActor [weak self] in self?.updatePointerState() }
++            let dragging = event.type == .leftMouseDragged
++            Task { @MainActor [weak self] in self?.pointerMoved(dragging: dragging) }
+             return event
+         }) {
+             eventMonitors.append(local)
+@@ -580,12 +643,94 @@ final class NotchIslandController {
+     }
+ 
+     private func closeMenuIfPointerOutside() {
+-        guard model.menuOpen, !model.containsPointer(NSEvent.mouseLocation) else { return }
++        guard !model.containsPointer(NSEvent.mouseLocation) else { return }
++        // A finished file card goes away with a click elsewhere.
++        if let task = model.fileTask, task.isFinished, !model.menuOpen {
++            fileActions.dismiss()
++        }
++        guard model.menuOpen else { return }
+         menuCloseTask?.cancel()
+         menuCloseTask = nil
+         model.closeMenu()
+     }
+ 
++    // MARK: File drag
++
++    private func pointerMoved(dragging: Bool) {
++        if dragging {
++            checkForFileDrag()
++        }
++        updatePointerState()
++    }
++
++    /// A new drag with files in it started somewhere on the screen.
++    private func checkForFileDrag() {
++        let pasteboard = NSPasteboard(name: .drag)
++        let count = pasteboard.changeCount
++        guard count != dragChangeCount else { return }
++        dragChangeCount = count
++        guard model.fileDrag == nil, NSEvent.pressedMouseButtons & 1 == 1 else { return }
++        let objects = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
++        // Finder hands out file reference URLs (/.file/id=…); turn them into normal paths.
++        let urls = ((objects as? [NSURL]) ?? []).compactMap { $0.filePathURL }
++        guard !urls.isEmpty else { return }
++        beginFileDrag(urls)
++    }
++
++    private func beginFileDrag(_ urls: [URL]) {
++        menuCloseTask?.cancel()
++        menuCloseTask = nil
++        model.closeMenu()
++        model.fileDrag = NotchFileDrag(urls: urls)
++        dragReleasedAt = nil
++        dragTimer?.invalidate()
++        // Follows the pointer even when the drag delivers no events to VoiceInk, and notices the
++        // end of the drag (dropped on the notch or anywhere else).
++        let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
++            MainActor.assumeIsolated {
++                self?.followFileDrag()
++            }
++        }
++        RunLoop.main.add(timer, forMode: .common)
++        dragTimer = timer
++    }
++
++    private func followFileDrag() {
++        guard model.fileDrag != nil else {
++            endFileDrag()
++            return
++        }
++        if NSEvent.pressedMouseButtons & 1 == 0 {
++            // Released. Keep the drop fields a moment, the drop itself arrives just after.
++            let released = dragReleasedAt ?? Date()
++            dragReleasedAt = released
++            if Date().timeIntervalSince(released) > 0.4 {
++                endFileDrag()
++            }
++            return
++        }
++        dragReleasedAt = nil
++        updatePointerState()
++    }
++
++    private func endFileDrag() {
++        dragTimer?.invalidate()
++        dragTimer = nil
++        dragReleasedAt = nil
++        if model.fileDrag != nil {
++            model.fileDrag = nil
++        }
++        updatePointerState()
++    }
++
++    /// Files were dropped on one of the fields below the notch.
++    private func handleDrop(_ action: NotchDropAction) {
++        let urls = model.fileDrag?.urls ?? []
++        endFileDrag()
++        guard !urls.isEmpty else { return }
++        fileActions.perform(action, on: urls)
++    }
++
+     private func removeEventMonitors() {
+         for monitor in eventMonitors {
+             NSEvent.removeMonitor(monitor)
+@@ -652,14 +797,16 @@ final class NotchIslandController {
+ 
+     private func updateScreenGlow() {
+         let phase = model.phase
+-        guard NotchIslandSettings.screenGlowEnabled, model.sessionActive, phase.showsScreenGlow,
+-            let screen = NSScreen.screens.first(where: { $0.frame == model.geometry.screenFrame })
+-        else {
++        let wantsGlow = NotchIslandSettings.screenGlowEnabled && NotchScreenGlowWindow.isSupported
++            && model.sessionActive && phase.showsScreenGlow
++        if wantsGlow, let screen = NSScreen.screens.first(where: { $0.frame == model.geometry.screenFrame }) {
++            // Starts with the outline where the island is right now, then follows it.
++            screenGlow.show(on: screen, meter: { [recorder] in recorder.audioMeterSnapshot() })
++            screenGlow.setMode(phase == .processing ? .processing : .speaking)
++        } else {
+             screenGlow.hide()
+-            return
+         }
+-        screenGlow.show(on: screen, meter: { [recorder] in recorder.audioMeterSnapshot() })
+-        screenGlow.setMode(phase == .processing ? .processing : .speaking)
++        // Always tracked: animates together with the island while the glow shows.
+         screenGlow.setIsland(glowIsland(for: phase))
+     }
+ 
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift b/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
+new file mode 100644
+index 0000000..1219c51
+--- /dev/null
++++ b/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
+@@ -0,0 +1,284 @@
++import AppKit
++import Combine
++
++/// What Spotify or Apple Music is playing, for the notch.
++///
++/// Both players announce every change (new track, play, pause) as a distributed notification, so
++/// nothing is polled. Cover art and the buttons (play/pause, skip) use AppleScript, and only while
++/// the player is running. macOS asks once whether VoiceInk may control the player.
++@MainActor
++final class NotchNowPlaying: NSObject, ObservableObject {
++    enum Player: String {
++        case spotify
++        case music
++
++        static let all: [Player] = [.spotify, .music]
++
++        var bundleIdentifier: String {
++            switch self {
++            case .spotify: return "com.spotify.client"
++            case .music: return "com.apple.Music"
++            }
++        }
++
++        var scriptName: String {
++            switch self {
++            case .spotify: return "Spotify"
++            case .music: return "Music"
++            }
++        }
++
++        var isRunning: Bool {
++            !NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).isEmpty
++        }
++    }
++
++    struct Track: Equatable {
++        let player: Player
++        let title: String
++        let artist: String
++        var isPlaying: Bool
++
++        var id: String { player.rawValue + "|" + title + "|" + artist }
++    }
++
++    private struct PlayerInfo: Sendable {
++        let state: String?
++        let title: String?
++        let artist: String?
++    }
++
++    @Published private(set) var track: Track?
++    @Published private(set) var artwork: NSImage?
++
++    private var artworkID: String?
++
++    override init() {
++        super.init()
++        let center = DistributedNotificationCenter.default()
++        // Delivered right away even while VoiceInk is in the background (the default would hold
++        // them back until the app becomes active).
++        center.addObserver(
++            self,
++            selector: #selector(spotifyChanged(_:)),
++            name: Notification.Name("com.spotify.client.PlaybackStateChanged"),
++            object: nil,
++            suspensionBehavior: .deliverImmediately
++        )
++        center.addObserver(
++            self,
++            selector: #selector(musicChanged(_:)),
++            name: Notification.Name("com.apple.Music.playerInfo"),
++            object: nil,
++            suspensionBehavior: .deliverImmediately
++        )
++        NSWorkspace.shared.notificationCenter.addObserver(
++            self,
++            selector: #selector(applicationTerminated(_:)),
++            name: NSWorkspace.didTerminateApplicationNotification,
++            object: nil
++        )
++
++        // A player that was already playing before VoiceInk started says nothing until it changes.
++        Task { @MainActor [weak self] in
++            try? await Task.sleep(nanoseconds: 2_000_000_000)
++            self?.refreshFromRunningPlayers()
++        }
++    }
++
++    deinit {
++        DistributedNotificationCenter.default().removeObserver(self)
++        NSWorkspace.shared.notificationCenter.removeObserver(self)
++    }
++
++    // MARK: Controls
++
++    func playPause() {
++        guard var current = track else { return }
++        send("playpause")
++        // Shown at once; the player's notification confirms it a moment later.
++        current.isPlaying.toggle()
++        track = current
++    }
++
++    func next() {
++        send("next track")
++    }
++
++    func previous() {
++        send("previous track")
++    }
++
++    private func send(_ command: String) {
++        guard let player = track?.player, player.isRunning else { return }
++        let source = Self.script(for: player, command)
++        Task {
++            _ = await NotchAppleScript.run(source)
++        }
++    }
++
++    // MARK: Notifications
++
++    @objc nonisolated private func spotifyChanged(_ notification: Notification) {
++        let info = Self.info(from: notification)
++        Task { @MainActor [weak self] in
++            self?.handle(info, from: .spotify)
++        }
++    }
++
++    @objc nonisolated private func musicChanged(_ notification: Notification) {
++        let info = Self.info(from: notification)
++        Task { @MainActor [weak self] in
++            self?.handle(info, from: .music)
++        }
++    }
++
++    @objc nonisolated private func applicationTerminated(_ notification: Notification) {
++        let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
++        let bundleIdentifier = app?.bundleIdentifier
++        Task { @MainActor [weak self] in
++            guard let self, let track = self.track, track.player.bundleIdentifier == bundleIdentifier else { return }
++            self.clear()
++        }
++    }
++
++    nonisolated private static func info(from notification: Notification) -> PlayerInfo {
++        let info = notification.userInfo ?? [:]
++        return PlayerInfo(
++            state: info["Player State"] as? String,
++            title: info["Name"] as? String,
++            artist: info["Artist"] as? String
++        )
++    }
++
++    private func handle(_ info: PlayerInfo, from player: Player) {
++        if info.state == "Stopped" {
++            if track?.player == player {
++                clear()
++            }
++            return
++        }
++
++        let playing = info.state == "Playing"
++        guard let title = info.title, !title.isEmpty else {
++            // Only the state changed.
++            if var current = track, current.player == player, info.state != nil {
++                current.isPlaying = playing
++                track = current
++            }
++            return
++        }
++
++        // Pausing one player must not hide what another one is playing.
++        if let current = track, current.player != player, current.isPlaying, !playing {
++            return
++        }
++
++        let newTrack = Track(player: player, title: title, artist: info.artist ?? "", isPlaying: playing)
++        if newTrack != track {
++            track = newTrack
++        }
++        loadArtworkIfNeeded()
++    }
++
++    private func clear() {
++        track = nil
++        artwork = nil
++        artworkID = nil
++    }
++
++    private func refreshFromRunningPlayers() {
++        guard track == nil else { return }
++        for player in Player.all where player.isRunning {
++            let source = Self.script(
++                for: player,
++                """
++                if player state is stopped then return ""
++                set stateName to "Paused"
++                if player state is playing then set stateName to "Playing"
++                return stateName & linefeed & (name of current track) & linefeed & (artist of current track)
++                """
++            )
++            Task { @MainActor [weak self] in
++                guard let output = await NotchAppleScript.run(source)?.string, !output.isEmpty else { return }
++                let parts = output.components(separatedBy: "\n")
++                guard parts.count >= 3, let self, self.track == nil else { return }
++                self.handle(PlayerInfo(state: parts[0], title: parts[1], artist: parts[2]), from: player)
++            }
++        }
++    }
++
++    // MARK: Artwork
++
++    private func loadArtworkIfNeeded() {
++        guard let track, track.id != artworkID else { return }
++        artworkID = track.id
++        artwork = nil
++        let id = track.id
++        let player = track.player
++
++        Task { @MainActor [weak self] in
++            // Give the player a moment to switch its current track.
++            try? await Task.sleep(nanoseconds: 250_000_000)
++            guard self?.artworkID == id else { return }
++            let image = await Self.fetchArtwork(from: player)
++            guard let self, self.artworkID == id else { return }
++            self.artwork = image
++        }
++    }
++
++    nonisolated private static func fetchArtwork(from player: Player) async -> NSImage? {
++        switch player {
++        case .spotify:
++            let source = Self.script(for: player, "return artwork url of current track")
++            guard let link = await NotchAppleScript.run(source)?.string, let url = URL(string: link) else {
++                return nil
++            }
++            let download = try? await URLSession.shared.data(from: url)
++            guard let data = download?.0 else { return nil }
++            return NSImage(data: data)
++        case .music:
++            let source = Self.script(
++                for: player,
++                "if (count of artworks of current track) > 0 then return data of artwork 1 of current track"
++            )
++            guard let data = await NotchAppleScript.run(source)?.data, !data.isEmpty else { return nil }
++            return NSImage(data: data)
++        }
++    }
++
++    /// Wraps commands so they never launch a player that is not running.
++    nonisolated private static func script(for player: Player, _ body: String) -> String {
++        let name = player.scriptName
++        return "if application \"" + name + "\" is running then\n"
++            + "tell application \"" + name + "\"\n"
++            + body + "\n"
++            + "end tell\n"
++            + "end if"
++    }
++}
++
++/// Runs AppleScript one at a time off the main thread (the first run may wait for the user to
++/// allow VoiceInk to control the app).
++enum NotchAppleScript {
++    struct Result: Sendable {
++        let string: String?
++        let data: Data?
++    }
++
++    private static let queue = DispatchQueue(label: "com.prakashjoshipax.voiceink.notch-applescript", qos: .userInitiated)
++
++    static func run(_ source: String) async -> Result? {
++        await withCheckedContinuation { continuation in
++            queue.async {
++                var error: NSDictionary?
++                let descriptor = NSAppleScript(source: source)?.executeAndReturnError(&error)
++                guard error == nil, let descriptor else {
++                    continuation.resume(returning: nil)
++                    return
++                }
++                continuation.resume(returning: Result(string: descriptor.stringValue, data: descriptor.data))
++            }
++        }
++    }
++}
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index 2c9ae2c..5d548f3 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -1,25 +1,23 @@
+ import AppKit
++import Metal
+ import QuartzCore
++import os
+ 
+ /// Outline of the island the glow wraps around, in points. The island sits centred at the top
+ /// edge of the screen.
+-struct NotchGlowIsland: Hashable {
++struct NotchGlowIsland: Equatable {
+     var width: CGFloat
+     var height: CGFloat
+     var topRadius: CGFloat
+     var bottomRadius: CGFloat
+ }
+ 
+-/// Siri-style light along the screen edges while dictating.
++/// Siri-style light along the screen edges while dictating, drawn by a small Metal shader.
+ ///
+-/// Drawn entirely with Core Animation: the edge masks are rendered once per screen and island
+-/// size, and the colours turn via a layer animation on the GPU, so nothing is redrawn on the main
+-/// thread. The voice only changes layer opacities: a strong line along the edge that gets thicker
+-/// while you speak, with a light shimmer inwards.
+-///
+-/// While dictating the line also runs around the island. That outline fades in only after the
+-/// island has finished growing, and disappears at once when the island changes or shrinks, so the
+-/// two never drift apart.
++/// Every frame the shader works out how far each pixel is from the lit edge: the screen border and
++/// the island's sides and bottom. The island outline is animated here with the same curve and
++/// duration the island itself uses, so the line always grows and shrinks together with the island.
++/// The voice makes the line thicker and lets the shimmer reach further.
+ @MainActor
+ final class NotchScreenGlowWindow {
+     enum Mode {
+@@ -27,268 +25,145 @@ final class NotchScreenGlowWindow {
+         case processing
+     }
+ 
+-    private enum MaskKind: String {
+-        /// Strong line at the edge plus a light shimmer.
+-        case base
+-        /// Thicker line that is faded in with the voice.
+-        case swell
++    /// Metal is available and the shader compiled.
++    static var isSupported: Bool { NotchGlowRenderer.shared != nil }
++
++    /// Compiles the shader in the background, so the first dictation starts without a hitch.
++    static func warmUp() {
++        DispatchQueue.global(qos: .utility).async {
++            _ = NotchGlowRenderer.shared
++        }
+     }
+ 
++    /// Same duration as the island's morph animation in SwiftUI.
++    static let islandDuration: CFTimeInterval = 0.42
++    private static let fadeDuration: CFTimeInterval = 0.35
++    private static let modeDuration: CFTimeInterval = 0.45
++    /// Inner rounding of the line in the screen corners (the outer corner is filled).
++    private static let screenRadius: Float = 18
++
+     private var panel: NSPanel?
++    private var metalLayer: CAMetalLayer?
++    private var displayLink: CADisplayLink?
++    private let ticker = NotchGlowTicker()
+     private var screenFrame: NSRect = .zero
+-    private var screenSize: CGSize = .zero
+     private var isShown = false
+-    private var mode: Mode?
+-    private var island: NotchGlowIsland?
+-    private var islandTask: Task<Void, Never>?
++    private var mode: Mode = .speaking
+     private var hideTask: Task<Void, Never>?
+-
+-    private let container = CALayer()
+-    /// Edges only (used while the island is changing size).
+-    private let edgeGroup = CALayer()
+-    /// Edges plus the line around the island.
+-    private let dipGroup = CALayer()
+-    private let edgeBase = GlowLayer()
+-    private let edgeSwell = GlowLayer()
+-    private let dipBase = GlowLayer()
+-    private let dipSwell = GlowLayer()
++    private var fastFrames = false
+ 
+     private var meter: (() -> AudioMeter)?
+-    private var levelTimer: Timer?
+-    private var smoothedLevel: Double = 0
+-
+-    private static var maskCache: [String: CGImage] = [:]
+-    private static let easing = CAMediaTimingFunction(controlPoints: 0.4, 0, 0.2, 1)
+-
+-    private static let speakingColors: [CGColor] = [
+-        0xFFC21A, 0xF7A400, 0xFFD23F, 0xF08C00, 0xFDCA3F, 0xFFB000, 0xFFC21A,
+-    ].map(color)
+-    private static let processingColors: [CGColor] = [
+-        0xFFFFFF, 0xD9DDE4, 0xB5BCC8, 0xFDCA3F, 0xD9DDE4, 0xB5BCC8, 0xFFFFFF,
+-    ].map(color)
+-
+-    private static func color(_ hex: Int) -> CGColor {
+-        CGColor(
+-            srgbRed: CGFloat((hex >> 16) & 0xFF) / 255,
+-            green: CGFloat((hex >> 8) & 0xFF) / 255,
+-            blue: CGFloat(hex & 0xFF) / 255,
+-            alpha: 1
+-        )
+-    }
+-
+-    /// A spinning conic gradient seen through a mask.
+-    private final class GlowLayer {
+-        let glow = CALayer()
+-        let mask = CALayer()
+-        let gradient = CAGradientLayer()
+-
+-        init() {
+-            gradient.type = .conic
+-            gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
+-            gradient.endPoint = CGPoint(x: 0.5, y: 0)
+-            glow.addSublayer(gradient)
+-            glow.mask = mask
+-        }
+-    }
+-
+-    private var allGlows: [GlowLayer] { [edgeBase, edgeSwell, dipBase, dipSwell] }
+-    private var swells: [GlowLayer] { [edgeSwell, dipSwell] }
+-    private var bases: [GlowLayer] { [edgeBase, dipBase] }
++    private var level: Double = 0
++    private var lastTick: CFTimeInterval = 0
++    private let epoch = CACurrentMediaTime()
++
++    private var opacity = NotchGlowTween()
++    private var processing = NotchGlowTween()
++    private var islandWidth = NotchGlowTween()
++    private var islandHeight = NotchGlowTween()
++    private var islandTop = NotchGlowTween()
++    private var islandBottom = NotchGlowTween()
++    private var island: NotchGlowIsland?
+ 
+     init() {
+-        container.opacity = 0
+-        dipGroup.opacity = 0
+-        edgeGroup.addSublayer(edgeBase.glow)
+-        edgeGroup.addSublayer(edgeSwell.glow)
+-        dipGroup.addSublayer(dipBase.glow)
+-        dipGroup.addSublayer(dipSwell.glow)
+-        container.addSublayer(edgeGroup)
+-        container.addSublayer(dipGroup)
+-        for layer in allGlows {
+-            layer.gradient.colors = Self.speakingColors
+-        }
+-        for layer in swells {
+-            layer.glow.opacity = 0
++        ticker.onTick = { [weak self] link in
++            MainActor.assumeIsolated {
++                guard let self else { return }
++                self.tick(link)
++            }
+         }
+     }
+ 
+     // MARK: Public API
+ 
+-    /// Renders the masks in the background so the first dictation starts without a hitch.
+-    func prepare(for screen: NSScreen, islands: [NotchGlowIsland]) {
+-        let size = screen.frame.size
+-        var jobs: [(key: String, island: NotchGlowIsland?, kind: MaskKind)] = []
+-        for kind in [MaskKind.base, .swell] {
+-            jobs.append((Self.cacheKey(size: size, island: nil, kind: kind), nil, kind))
+-            for island in islands {
+-                jobs.append((Self.cacheKey(size: size, island: island, kind: kind), island, kind))
+-            }
+-        }
+-        jobs = jobs.filter { Self.maskCache[$0.key] == nil }
+-        guard !jobs.isEmpty else { return }
+-
+-        DispatchQueue.global(qos: .utility).async {
+-            var results: [(String, CGImage)] = []
+-            for job in jobs {
+-                if let image = NotchScreenGlowWindow.renderMask(size: size, island: job.island, kind: job.kind) {
+-                    results.append((job.key, image))
+-                }
+-            }
+-            DispatchQueue.main.async {
+-                MainActor.assumeIsolated {
+-                    for (key, image) in results {
+-                        NotchScreenGlowWindow.maskCache[key] = image
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+     /// Fades the glow in on the given screen (does nothing if it is already showing there).
++    /// The island outline starts where the island currently is.
+     func show(on screen: NSScreen, meter: @escaping () -> AudioMeter) {
++        guard NotchGlowRenderer.shared != nil else { return }
+         self.meter = meter
+         hideTask?.cancel()
+         hideTask = nil
+ 
+-        let panel = ensurePanel()
+-        if screenFrame != screen.frame {
+-            screenFrame = screen.frame
+-            screenSize = screen.frame.size
+-            panel.setFrame(screen.frame, display: false)
+-            layout()
+-            island = nil
+-        }
+-
++        ensurePanel(on: screen)
+         guard !isShown else { return }
+         isShown = true
+-        panel.orderFrontRegardless()
+-        startSpinning()
+-        animate(container, to: 1, duration: 0.35)
+-        startLevelTimer()
++        opacity.retarget(1, duration: Self.fadeDuration, at: CACurrentMediaTime())
++        startDisplayLink()
+     }
+ 
+-    /// The island the line should run around (nil: edges only). The outline leaves at once and
+-    /// comes back once the island has settled at its new size.
+-    func setIsland(_ newIsland: NotchGlowIsland?) {
++    /// The island the line runs around. Call it on every change of the island, also while the
++    /// glow is hidden: then the outline jumps, while visible it animates like the island.
++    func setIsland(_ newIsland: NotchGlowIsland) {
+         guard newIsland != island else { return }
++        let animated = island != nil && panel != nil
+         island = newIsland
+-        islandTask?.cancel()
+-        islandTask = nil
+-        showOutline(false, duration: 0.12)
+-
+-        guard let newIsland, screenSize != .zero else { return }
+-        let size = screenSize
+-        islandTask = Task { @MainActor [weak self] in
+-            // The island grows in 0.42 s; the outline must not show up ahead of it.
+-            try? await Task.sleep(nanoseconds: 400_000_000)
+-            guard !Task.isCancelled else { return }
+-
+-            var masks: [MaskKind: CGImage] = [:]
+-            for kind in [MaskKind.base, .swell] {
+-                let key = NotchScreenGlowWindow.cacheKey(size: size, island: newIsland, kind: kind)
+-                if let cached = NotchScreenGlowWindow.maskCache[key] {
+-                    masks[kind] = cached
+-                } else if let image = await Task.detached(priority: .userInitiated, operation: {
+-                    NotchScreenGlowWindow.renderMask(size: size, island: newIsland, kind: kind)
+-                }).value {
+-                    NotchScreenGlowWindow.maskCache[key] = image
+-                    masks[kind] = image
+-                }
++        let now = CACurrentMediaTime()
++        let duration = NotchScreenGlowWindow.islandDuration
++
++        func update(_ tween: inout NotchGlowTween, to value: CGFloat) {
++            if animated {
++                tween.retarget(Double(value), duration: duration, at: now)
++            } else {
++                tween.jump(to: Double(value))
+             }
+-
+-            guard let self, !Task.isCancelled, self.island == newIsland,
+-                let base = masks[.base], let swell = masks[.swell]
+-            else { return }
+-            CATransaction.begin()
+-            CATransaction.setDisableActions(true)
+-            self.dipBase.mask.contents = base
+-            self.dipSwell.mask.contents = swell
+-            CATransaction.commit()
+-            self.showOutline(true, duration: 0.25)
+         }
++        update(&islandWidth, to: newIsland.width)
++        update(&islandHeight, to: newIsland.height)
++        update(&islandTop, to: newIsland.topRadius)
++        update(&islandBottom, to: newIsland.bottomRadius)
+     }
+ 
+     func setMode(_ newMode: Mode) {
+         guard newMode != mode else { return }
+         mode = newMode
+-        let colors = newMode == .speaking ? Self.speakingColors : Self.processingColors
+-
+-        for layer in allGlows {
+-            let change = CABasicAnimation(keyPath: "colors")
+-            change.fromValue = layer.gradient.presentation()?.colors ?? layer.gradient.colors
+-            change.toValue = colors
+-            change.duration = 0.45
+-            change.timingFunction = Self.easing
+-            layer.gradient.colors = colors
+-            layer.gradient.add(change, forKey: "colors")
+-        }
+-
+-        switch newMode {
+-        case .speaking:
+-            for layer in bases {
+-                layer.glow.removeAnimation(forKey: "pulse")
+-                animate(layer.glow, to: 1, duration: 0.3)
+-            }
+-        case .processing:
+-            for layer in swells {
+-                animate(layer.glow, to: 0, duration: 0.3)
+-            }
+-            for layer in bases {
+-                let pulse = CABasicAnimation(keyPath: "opacity")
+-                pulse.fromValue = 0.45
+-                pulse.toValue = 0.95
+-                pulse.duration = 0.9
+-                pulse.autoreverses = true
+-                pulse.repeatCount = .infinity
+-                pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+-                layer.glow.add(pulse, forKey: "pulse")
+-            }
+-        }
++        processing.retarget(newMode == .processing ? 1 : 0, duration: Self.modeDuration, at: CACurrentMediaTime())
+     }
+ 
+     func hide() {
+         guard isShown else { return }
+         isShown = false
+-        mode = nil
+-        island = nil
+-        islandTask?.cancel()
+-        islandTask = nil
+-        stopLevelTimer()
+-        // The outline goes first, together with the shrinking island; then everything fades.
+-        showOutline(false, duration: 0.12)
+-        animate(container, to: 0, duration: 0.35)
++        opacity.retarget(0, duration: Self.fadeDuration, at: CACurrentMediaTime())
++        hideTask?.cancel()
+         hideTask = Task { @MainActor [weak self] in
+-            try? await Task.sleep(nanoseconds: 450_000_000)
+-            guard let self, !Task.isCancelled else { return }
+-            self.panel?.orderOut(nil)
+-            for layer in self.allGlows {
+-                layer.glow.removeAllAnimations()
+-                layer.gradient.removeAnimation(forKey: "spin")
+-            }
+-            for layer in self.swells {
+-                layer.glow.opacity = 0
+-            }
+-            self.smoothedLevel = 0
++            // Let the fade and the island's collapse finish before the window goes away.
++            try? await Task.sleep(nanoseconds: 480_000_000)
++            guard let self, !Task.isCancelled, !self.isShown else { return }
++            self.tearDown()
+         }
+     }
+ 
+     func destroy() {
+-        stopLevelTimer()
+         hideTask?.cancel()
+-        islandTask?.cancel()
+-        panel?.orderOut(nil)
+-        panel?.close()
+-        panel = nil
++        hideTask = nil
+         isShown = false
+-        mode = nil
+-        island = nil
++        tearDown()
+     }
+ 
+-    // MARK: Window and layers
++    // MARK: Window
+ 
+-    private func ensurePanel() -> NSPanel {
+-        if let panel { return panel }
++    private func ensurePanel(on screen: NSScreen) {
++        let panel = self.panel ?? makePanel()
++        if screenFrame != screen.frame || metalLayer?.contentsScale != screen.backingScaleFactor {
++            screenFrame = screen.frame
++            panel.setFrame(screen.frame, display: false)
++            if let metalLayer {
++                CATransaction.begin()
++                CATransaction.setDisableActions(true)
++                metalLayer.frame = CGRect(origin: .zero, size: screen.frame.size)
++                metalLayer.contentsScale = screen.backingScaleFactor
++                metalLayer.drawableSize = CGSize(
++                    width: (screen.frame.width * screen.backingScaleFactor).rounded(),
++                    height: (screen.frame.height * screen.backingScaleFactor).rounded()
++                )
++                CATransaction.commit()
++            }
++        }
++        if !panel.isVisible {
++            panel.orderFrontRegardless()
++        }
++    }
+ 
++    private func makePanel() -> NSPanel {
+         let newPanel = NSPanel(
+             contentRect: .zero,
+             styleMask: [.borderless, .nonactivatingPanel],
+@@ -296,6 +171,7 @@ final class NotchScreenGlowWindow {
+             defer: false
+         )
+         newPanel.isFloatingPanel = true
++        newPanel.isReleasedWhenClosed = false
+         // Just below the island window, so the island covers the glow along the top edge.
+         newPanel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+         newPanel.backgroundColor = .clear
+@@ -305,226 +181,371 @@ final class NotchScreenGlowWindow {
+         newPanel.ignoresMouseEvents = true
+         newPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+ 
+-        let root = CALayer()
+-        root.addSublayer(container)
++        let layer = CAMetalLayer()
++        layer.device = NotchGlowRenderer.shared?.device
++        layer.pixelFormat = .bgra8Unorm
++        layer.framebufferOnly = true
++        layer.isOpaque = false
++        layer.backgroundColor = nil
++        layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
++        layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
++
+         let view = NSView()
+-        view.layer = root
++        view.layer = layer
+         view.wantsLayer = true
+         newPanel.contentView = view
+ 
+         panel = newPanel
++        metalLayer = layer
++        screenFrame = .zero
+         return newPanel
+     }
+ 
+-    private func layout() {
+-        CATransaction.begin()
+-        CATransaction.setDisableActions(true)
+-
+-        let size = screenSize
+-        let bounds = CGRect(origin: .zero, size: size)
+-        container.frame = bounds
+-        edgeGroup.frame = bounds
+-        dipGroup.frame = bounds
+-        // The gradients spin, so they must cover the screen at every angle.
+-        let diagonal = (size.width * size.width + size.height * size.height).squareRoot()
+-        for layer in allGlows {
+-            layer.glow.frame = bounds
+-            layer.mask.frame = bounds
+-            layer.gradient.bounds = CGRect(x: 0, y: 0, width: diagonal, height: diagonal)
+-            layer.gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
+-        }
+-
+-        edgeBase.mask.contents = Self.mask(size: size, island: nil, kind: .base)
+-        edgeSwell.mask.contents = Self.mask(size: size, island: nil, kind: .swell)
+-        dipGroup.opacity = 0
+-        edgeGroup.opacity = 1
+-
+-        CATransaction.commit()
++    private func tearDown() {
++        stopDisplayLink()
++        panel?.orderOut(nil)
++        panel?.close()
++        panel = nil
++        metalLayer = nil
++        screenFrame = .zero
++        level = 0
++        mode = .speaking
++        processing.jump(to: 0)
++        opacity.jump(to: 0)
++        // The outline keeps its target, so the next show starts from where the island is.
++        islandWidth.jump(to: islandWidth.to)
++        islandHeight.jump(to: islandHeight.to)
++        islandTop.jump(to: islandTop.to)
++        islandBottom.jump(to: islandBottom.to)
+     }
+ 
+-    private func showOutline(_ visible: Bool, duration: CFTimeInterval) {
+-        animate(dipGroup, to: visible ? 1 : 0, duration: duration)
+-        animate(edgeGroup, to: visible ? 0 : 1, duration: duration)
+-    }
++    // MARK: Frames
+ 
+-    private func startSpinning() {
+-        for (index, layer) in allGlows.enumerated() {
+-            guard layer.gradient.animation(forKey: "spin") == nil else { continue }
+-            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+-            spin.fromValue = 0
+-            // The swell turns the other way, which keeps the colours moving like Siri's light.
+-            spin.toValue = index % 2 == 0 ? 2 * Double.pi : -2 * Double.pi
+-            spin.duration = index % 2 == 0 ? 7 : 10
+-            spin.repeatCount = .infinity
+-            layer.gradient.add(spin, forKey: "spin")
+-        }
++    private func startDisplayLink() {
++        guard displayLink == nil, let view = panel?.contentView else { return }
++        let link = view.displayLink(target: ticker, selector: #selector(NotchGlowTicker.tick(_:)))
++        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
++        fastFrames = false
++        link.add(to: .main, forMode: .common)
++        displayLink = link
++        lastTick = 0
+     }
+ 
+-    private func animate(_ layer: CALayer, to opacity: Float, duration: CFTimeInterval) {
+-        CATransaction.begin()
+-        CATransaction.setAnimationDuration(duration)
+-        CATransaction.setAnimationTimingFunction(Self.easing)
+-        layer.opacity = opacity
+-        CATransaction.commit()
++    private func stopDisplayLink() {
++        displayLink?.invalidate()
++        displayLink = nil
+     }
+ 
+-    // MARK: Voice level
++    private func tick(_ link: CADisplayLink) {
++        guard let metalLayer, let renderer = NotchGlowRenderer.shared else { return }
++        let now = CACurrentMediaTime()
++        let delta = lastTick > 0 ? min(max(now - lastTick, 0), 0.1) : 1.0 / 60.0
++        lastTick = now
++        // Evaluate the animations for the moment the frame appears on screen.
++        let time = max(link.targetTimestamp, now)
++
++        updateLevel(delta: delta)
++        updateFrameRate(at: time, link: link)
++
++        let size = screenFrame.size
++        guard size.width > 0, size.height > 0, let drawable = metalLayer.nextDrawable() else { return }
++
++        var uniforms = NotchGlowUniforms(
++            width: Float(size.width),
++            height: Float(size.height),
++            scale: Float(drawable.texture.width) / Float(size.width),
++            time: Float(fmod(now - epoch, 70)),
++            opacity: Float(opacity.value(at: time)),
++            level: Float(level),
++            processing: Float(processing.value(at: time)),
++            islandWidth: Float(islandWidth.value(at: time)),
++            islandHeight: Float(islandHeight.value(at: time)),
++            islandTopRadius: Float(islandTop.value(at: time)),
++            islandBottomRadius: Float(islandBottom.value(at: time)),
++            screenRadius: Self.screenRadius
++        )
+ 
+-    private func startLevelTimer() {
+-        guard levelTimer == nil else { return }
+-        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+-            MainActor.assumeIsolated {
+-                self?.updateLevel()
+-            }
+-        }
+-        RunLoop.main.add(timer, forMode: .common)
+-        levelTimer = timer
++        let pass = MTLRenderPassDescriptor()
++        pass.colorAttachments[0].texture = drawable.texture
++        pass.colorAttachments[0].loadAction = .clear
++        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
++        pass.colorAttachments[0].storeAction = .store
++
++        guard let commands = renderer.queue.makeCommandBuffer(),
++            let encoder = commands.makeRenderCommandEncoder(descriptor: pass)
++        else { return }
++        encoder.setRenderPipelineState(renderer.pipeline)
++        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<NotchGlowUniforms>.stride, index: 0)
++        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
++        encoder.endEncoding()
++        commands.present(drawable)
++        commands.commit()
+     }
+ 
+-    private func stopLevelTimer() {
+-        levelTimer?.invalidate()
+-        levelTimer = nil
++    /// Full frame rate while the island changes size (to keep up with it), 60 fps otherwise.
++    private func updateFrameRate(at time: CFTimeInterval, link: CADisplayLink) {
++        let moving = !islandWidth.isFinished(at: time) || !islandHeight.isFinished(at: time)
++        guard moving != fastFrames else { return }
++        fastFrames = moving
++        link.preferredFrameRateRange = moving
++            ? CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
++            : CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+     }
+ 
+-    private func updateLevel() {
+-        guard mode == .speaking, let meter else { return }
+-        let target = max(0, min(1, pow(meter().averagePower, 0.6)))
+-        let rate = target > smoothedLevel ? 0.55 : 0.15
+-        smoothedLevel += (target - smoothedLevel) * rate
+-
+-        CATransaction.begin()
+-        CATransaction.setAnimationDuration(1.0 / 30.0)
+-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+-        for layer in swells {
+-            layer.glow.opacity = Float(smoothedLevel)
++    private func updateLevel(delta: CFTimeInterval) {
++        var target: Double = 0
++        if isShown, mode == .speaking, let meter {
++            target = max(0, min(1, pow(meter().averagePower, 0.6)))
+         }
+-        CATransaction.commit()
++        // Quick to rise, slower to fall (rates per 1/30 s).
++        let rate = target > level ? 0.55 : 0.15
++        let factor = 1 - pow(1 - rate, delta * 30)
++        level += (target - level) * factor
+     }
++}
+ 
+-    // MARK: Masks
++// MARK: - Animation
++
++/// One animated value with the island's ease-in-out curve.
++struct NotchGlowTween {
++    private(set) var from: Double = 0
++    private(set) var to: Double = 0
++    private var start: CFTimeInterval = 0
++    private var duration: CFTimeInterval = 0
++
++    func value(at time: CFTimeInterval) -> Double {
++        guard duration > 0 else { return to }
++        let progress = (time - start) / duration
++        if progress >= 1 { return to }
++        if progress <= 0 { return from }
++        return from + (to - from) * Self.ease(progress)
++    }
+ 
+-    private static func cacheKey(size: CGSize, island: NotchGlowIsland?, kind: MaskKind) -> String {
+-        var key = "\(kind.rawValue)-\(Int(size.width))x\(Int(size.height))"
+-        if let island {
+-            key += "-\(Int(island.width))x\(Int(island.height))-\(Int(island.topRadius))-\(Int(island.bottomRadius))"
+-        }
+-        return key
++    func isFinished(at time: CFTimeInterval) -> Bool {
++        duration <= 0 || time >= start + duration
+     }
+ 
+-    private static func mask(size: CGSize, island: NotchGlowIsland?, kind: MaskKind) -> CGImage? {
+-        let key = cacheKey(size: size, island: island, kind: kind)
+-        if let cached = maskCache[key] { return cached }
+-        let image = renderMask(size: size, island: island, kind: kind)
+-        maskCache[key] = image
+-        return image
++    /// Moves on from wherever the value is right now.
++    mutating func retarget(_ target: Double, duration: CFTimeInterval, at time: CFTimeInterval) {
++        guard target != to else { return }
++        from = value(at: time)
++        to = target
++        start = time
++        self.duration = duration
+     }
+ 
+-    /// Alpha for a pixel at signed distance from the lit edge (negative inside the
+-    /// lit area, positive in the corners outside the rounded screen and inside the island).
+-    nonisolated private static func alpha(_ distance: CGFloat, kind: MaskKind) -> CGFloat {
+-        let inside = -distance
+-        switch kind {
+-        case .base:
+-            // A firm line of about 2 pt with a light, short shimmer.
+-            if distance > 0 { return max(0, 1 - distance / 0.8) }
+-            let line = max(0, min(1, 1 - (inside - 2.0) / 1.4))
+-            let shimmer = 0.22 * exp(-pow(inside / 10, 1.5))
+-            return line + shimmer * (1 - line)
+-        case .swell:
+-            // The same line, about 5 pt thick: faded in with the voice it makes the edge grow.
+-            if distance > 0 { return max(0, 1 - distance / 0.8) }
+-            let line = max(0, min(1, 1 - (inside - 4.5) / 3.0))
+-            let shimmer = 0.18 * exp(-pow(inside / 16, 1.5))
+-            return line + shimmer * (1 - line)
+-        }
++    mutating func jump(to target: Double) {
++        from = target
++        to = target
++        duration = 0
+     }
+ 
+-    /// Fills every pixel by its distance to the lit edge: the rounded screen border and, when an
+-    /// island is given, the island's sides and bottom (smoothly joined at the top corners).
+-    nonisolated private static func renderMask(size: CGSize, island: NotchGlowIsland?, kind: MaskKind) -> CGImage? {
+-        let width = max(1, Int(size.width.rounded(.up)))
+-        let height = max(1, Int(size.height.rounded(.up)))
+-        guard
+-            let context = CGContext(
+-                data: nil,
+-                width: width,
+-                height: height,
+-                bitsPerComponent: 8,
+-                bytesPerRow: width * 4,
+-                space: CGColorSpaceCreateDeviceRGB(),
+-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+-            ),
+-            let data = context.data
+-        else { return nil }
+-
+-        let pixels = data.bindMemory(to: UInt8.self, capacity: width * height * 4)
+-        let screenHalfWidth = CGFloat(width) / 2
+-        let screenHalfHeight = CGFloat(height) / 2
+-        // Rounded like the notch, so the light follows smooth curves into the corners.
+-        let screenRadius: CGFloat = 18
+-
+-        // Island as a box hanging from the top edge (its upper half is above the screen).
+-        let islandHalfWidth = island.map { max(0, $0.width / 2 - $0.topRadius) } ?? 0
+-        let islandHeight = island?.height ?? 0
+-        let islandRadius = island.map { min($0.bottomRadius, islandHalfWidth, $0.height) } ?? 0
+-        let blend = (island?.topRadius ?? 0) * 2
+-        // Beyond this the light has faded to nothing.
+-        let reach: CGFloat = 120
+-
+-        for row in 0..<height {
+-            // Row 0 is the top of the image (and of the screen).
+-            let y = CGFloat(row) + 0.5
+-            let edgeY = min(y, CGFloat(height) - y)
+-            for column in 0..<width {
+-                let x = CGFloat(column) + 0.5
+-                let offset = (row * width + column) * 4
+-                let nearIsland = island != nil
+-                    && y < islandHeight + reach
+-                    && abs(x - screenHalfWidth) < islandHalfWidth + islandRadius + reach
+-                if edgeY > reach && min(x, CGFloat(width) - x) > reach && !nearIsland {
+-                    pixels[offset] = 0
+-                    pixels[offset + 1] = 0
+-                    pixels[offset + 2] = 0
+-                    pixels[offset + 3] = 0
+-                    continue
+-                }
+-
+-                var distance = roundedBoxDistance(
+-                    x: x - screenHalfWidth, y: y - screenHalfHeight,
+-                    halfWidth: screenHalfWidth, halfHeight: screenHalfHeight, radius: screenRadius
+-                )
+-                if island != nil {
+-                    let islandDistance = roundedBoxDistance(
+-                        x: x - screenHalfWidth, y: y,
+-                        halfWidth: islandHalfWidth, halfHeight: islandHeight, radius: islandRadius
+-                    )
+-                    // Lit area = inside the screen and outside the island (smooth at the joint).
+-                    distance = smoothMax(distance, -islandDistance, blend: blend)
+-                }
+-
+-                let value = UInt8((max(0, min(1, alpha(distance, kind: kind))) * 255).rounded())
+-                pixels[offset] = value
+-                pixels[offset + 1] = value
+-                pixels[offset + 2] = value
+-                pixels[offset + 3] = value
++    /// cubic-bezier(0.4, 0, 0.2, 1), the curve of NotchIslandStyle.morph.
++    static func ease(_ progress: Double) -> Double {
++        let x = min(max(progress, 0), 1)
++        let cx = 3 * 0.4
++        let bx = 3 * (0.2 - 0.4) - cx
++        let ax = 1 - cx - bx
++        let cy = 0.0
++        let by = 3 * (1.0 - 0.0) - cy
++        let ay = 1 - cy - by
++
++        // The x curve rises monotonically, so bisection always finds the right t.
++        var low = 0.0
++        var high = 1.0
++        var t = x
++        for _ in 0..<24 {
++            let sample = ((ax * t + bx) * t + cx) * t
++            if sample < x {
++                low = t
++            } else {
++                high = t
+             }
++            t = (low + high) / 2
+         }
+-        return context.makeImage()
++        return ((ay * t + by) * t + cy) * t
+     }
++}
++
++private final class NotchGlowTicker: NSObject {
++    var onTick: ((CADisplayLink) -> Void)?
+ 
+-    /// Signed distance to a rounded box centred at the origin (negative inside).
+-    nonisolated private static func roundedBoxDistance(
+-        x: CGFloat, y: CGFloat, halfWidth: CGFloat, halfHeight: CGFloat, radius: CGFloat
+-    ) -> CGFloat {
+-        let qx = abs(x) - halfWidth + radius
+-        let qy = abs(y) - halfHeight + radius
+-        let outside = (max(qx, 0) * max(qx, 0) + max(qy, 0) * max(qy, 0)).squareRoot()
+-        return outside + min(max(qx, qy), 0) - radius
++    @objc func tick(_ link: CADisplayLink) {
++        onTick?(link)
+     }
++}
++
++// MARK: - Metal
++
++/// Same layout as NotchGlowUniforms in the shader (only floats, so no padding).
++struct NotchGlowUniforms {
++    var width: Float
++    var height: Float
++    var scale: Float
++    var time: Float
++    var opacity: Float
++    var level: Float
++    var processing: Float
++    var islandWidth: Float
++    var islandHeight: Float
++    var islandTopRadius: Float
++    var islandBottomRadius: Float
++    var screenRadius: Float
++}
++
++/// Compiles the glow shader once. nil when Metal is not available or compiling failed (the
++/// island then draws its own outline).
++final class NotchGlowRenderer: @unchecked Sendable {
++    static let shared: NotchGlowRenderer? = NotchGlowRenderer()
+ 
+-    nonisolated private static func smoothMax(_ a: CGFloat, _ b: CGFloat, blend: CGFloat) -> CGFloat {
+-        guard blend > 0 else { return max(a, b) }
+-        let h = max(blend - abs(a - b), 0) / blend
+-        return max(a, b) + h * h * blend * 0.25
++    let device: MTLDevice
++    let queue: MTLCommandQueue
++    let pipeline: MTLRenderPipelineState
++
++    private init?() {
++        let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "NotchGlow")
++        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
++            logger.error("Notch glow: no Metal device")
++            return nil
++        }
++        do {
++            let library = try device.makeLibrary(source: NotchGlowShader.source, options: nil)
++            let descriptor = MTLRenderPipelineDescriptor()
++            descriptor.vertexFunction = library.makeFunction(name: "notchGlowVertex")
++            descriptor.fragmentFunction = library.makeFunction(name: "notchGlowFragment")
++            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
++            let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
++            self.device = device
++            self.queue = queue
++            self.pipeline = pipeline
++        } catch {
++            logger.error("Notch glow shader failed: \(error.localizedDescription, privacy: .public)")
++            return nil
++        }
+     }
+ }
++
++enum NotchGlowShader {
++    static let source = """
++        #include <metal_stdlib>
++        using namespace metal;
++
++        struct NotchGlowUniforms {
++            float width;
++            float height;
++            float scale;
++            float time;
++            float opacity;
++            float level;
++            float processing;
++            float islandWidth;
++            float islandHeight;
++            float islandTopRadius;
++            float islandBottomRadius;
++            float screenRadius;
++        };
++
++        struct NotchGlowVertexOut {
++            float4 position [[position]];
++        };
++
++        constant float3 goldStops[7] = {
++            float3(1.000f, 0.761f, 0.102f), float3(0.969f, 0.643f, 0.000f), float3(1.000f, 0.824f, 0.247f),
++            float3(0.941f, 0.549f, 0.000f), float3(0.992f, 0.792f, 0.247f), float3(1.000f, 0.690f, 0.000f),
++            float3(1.000f, 0.761f, 0.102f)
++        };
++
++        constant float3 silverStops[7] = {
++            float3(1.000f, 1.000f, 1.000f), float3(0.851f, 0.867f, 0.894f), float3(0.710f, 0.737f, 0.784f),
++            float3(0.992f, 0.792f, 0.247f), float3(0.851f, 0.867f, 0.894f), float3(0.710f, 0.737f, 0.784f),
++            float3(1.000f, 1.000f, 1.000f)
++        };
++
++        // One triangle that covers the whole screen.
++        vertex NotchGlowVertexOut notchGlowVertex(uint vertexID [[vertex_id]]) {
++            float2 corner = float2(float((vertexID << 1) & 2), float(vertexID & 2));
++            NotchGlowVertexOut result;
++            result.position = float4(corner * 2.0f - 1.0f, 0.0f, 1.0f);
++            return result;
++        }
++
++        // Signed distance to a rounded box centred at the origin (negative inside).
++        static float roundedBox(float2 p, float2 halfSize, float radius) {
++            float2 q = abs(p) - halfSize + radius;
++            return length(max(q, float2(0.0f))) + min(max(q.x, q.y), 0.0f) - radius;
++        }
++
++        // Intersection of two areas with the corner between them rounded (radius).
++        static float roundIntersect(float a, float b, float radius) {
++            float2 u = max(float2(a + radius, b + radius), float2(0.0f));
++            return min(-radius, max(a, b)) + length(u);
++        }
++
++        static float3 rampColor(constant float3 *stops, float u) {
++            float x = fract(u) * 6.0f;
++            int index = min(int(floor(x)), 5);
++            float f = x - float(index);
++            f = f * f * (3.0f - 2.0f * f);
++            return mix(stops[index], stops[index + 1], f);
++        }
++
++        fragment float4 notchGlowFragment(NotchGlowVertexOut in [[stage_in]],
++                                          constant NotchGlowUniforms &u [[buffer(0)]]) {
++            float2 p = in.position.xy / u.scale;
++            float2 size = float2(u.width, u.height);
++            float2 center = size * 0.5f;
++
++            // Nothing to draw far away from the edges and the island.
++            float islandHalf = u.islandWidth * 0.5f;
++            float edge = min(min(p.x, size.x - p.x), min(p.y, size.y - p.y));
++            bool nearIsland = abs(p.x - center.x) < islandHalf + 120.0f && p.y < u.islandHeight + 120.0f;
++            if (edge > 120.0f && !nearIsland) {
++                return float4(0.0f);
++            }
++
++            // Lit edge: inside the screen (outer corners filled, inner side rounded) and outside
++            // the island, joined by the island's outward curve at the top.
++            float dScreen = roundedBox(p - center, center, u.screenRadius);
++            float top = min(u.islandTopRadius, min(islandHalf, u.islandHeight));
++            float halfWidth = max(islandHalf - top, 0.0f);
++            float bottom = min(u.islandBottomRadius, min(halfWidth, max(u.islandHeight - top, 0.0f)));
++            float d = dScreen;
++            float dIsland = 10000.0f;
++            if (u.islandHeight > 0.5f && halfWidth > 0.5f) {
++                dIsland = roundedBox(float2(p.x - center.x, p.y), float2(halfWidth, u.islandHeight), bottom);
++                d = roundIntersect(dScreen, -dIsland, top);
++            }
++            float e = max(-d, 0.0f);
++
++            // The shimmer uses a soft minimum of the distances, so it stays smooth in every corner.
++            float4 edges = max(float4(p.y, size.y - p.y, p.x, size.x - p.x), float4(0.05f));
++            float4 inv = 1.0f / (edges * edges);
++            inv = inv * inv;
++            float islandDistance = max(dIsland, 0.05f);
++            float islandInverse = 1.0f / (islandDistance * islandDistance);
++            float total = inv.x + inv.y + inv.z + inv.w + islandInverse * islandInverse;
++            float glowDistance = rsqrt(sqrt(total));
++
++            float level = clamp(u.level, 0.0f, 1.0f);
++            float lineWidth = mix(2.4f, 5.4f, level);
++            float soft = mix(1.2f, 2.2f, level);
++            float line = 1.0f - smoothstep(lineWidth, lineWidth + soft, e);
++            float strength = mix(0.28f, 0.36f, level);
++            float reach = mix(15.0f, 25.0f, level);
++            float shimmer = strength * exp(-pow(glowDistance / reach, 1.5f));
++            float alpha = line + shimmer * (1.0f - line);
++
++            float pulse = 0.5f + 0.5f * sin(u.time * 6.2831853f / 1.75f);
++            alpha *= mix(1.0f, 0.45f + 0.5f * pulse, u.processing);
++            alpha *= clamp(u.opacity, 0.0f, 1.0f);
++
++            float2 fromCenter = p - center;
++            float angle = atan2(fromCenter.x, -fromCenter.y) / 6.2831853f;
++            float3 forward = rampColor(goldStops, angle + u.time / 7.0f);
++            float3 backward = rampColor(goldStops, -angle + u.time / 10.0f);
++            float3 color = mix(forward, backward, 0.35f * level);
++            color = mix(color, rampColor(silverStops, angle + u.time / 7.0f), u.processing);
++            return float4(color * alpha, alpha);
++        }
++        """
++}
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index d283af4..c137f9c 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -1,4 +1,5 @@
+ import SwiftUI
++import UniformTypeIdentifiers
+ 
+ // MARK: - PromoPulse colours
+ 
+@@ -49,6 +50,8 @@ struct NotchIslandView: View {
+     let onClose: () -> Void
+     let onAssistantFollowUp: (String) -> Void
+     let onRetryLast: () -> Void
++    let onFileDrop: (NotchDropAction) -> Void
++    let onDismissFileTask: () -> Void
+ 
+     @AppStorage(RecorderDisplaySettingsKeys.showLiveTranscript) private var showLiveTranscript = true
+     @AppStorage(NotchIslandSettings.screenGlowKey) private var screenGlowEnabled = true
+@@ -63,7 +66,8 @@ struct NotchIslandView: View {
+         let size = model.size(for: phase)
+         let shape = Self.shape(for: phase)
+         // The screen-edge glow (its own window) is on: the island's outline joins that line.
+-        let joinsScreenGlow = screenGlowEnabled && model.sessionActive && phase.showsScreenGlow
++        let joinsScreenGlow = screenGlowEnabled && NotchScreenGlowWindow.isSupported
++            && model.sessionActive && phase.showsScreenGlow
+ 
+         VStack(spacing: NotchIslandModel.cardGap) {
+             island(phase: phase, size: size, shape: shape, joinsScreenGlow: joinsScreenGlow)
+@@ -72,6 +76,11 @@ struct NotchIslandView: View {
+                 NotchMenuCard(model: model, onDictate: onTap, onRetry: onRetryLast)
+                     .transition(Self.cardTransition)
+             }
++
++            if phase == .fileTask, let task = model.fileTask {
++                NotchFileTaskCard(task: task, onDismiss: onDismissFileTask)
++                    .transition(Self.cardTransition)
++            }
+         }
+         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+         .animation(NotchIslandStyle.morph, value: phase)
+@@ -80,11 +89,16 @@ struct NotchIslandView: View {
+ 
+     // MARK: - Island
+ 
+-    private func island(phase: NotchIslandPhase, size: CGSize, shape: NotchShape, joinsScreenGlow: Bool) -> some View {
+-        VStack(spacing: 0) {
++    private func island(phase: NotchIslandPhase, size: CGSize, shape: NotchIslandShape, joinsScreenGlow: Bool) -> some View {
++        // The island draws its own gold outline when the screen glow does not (and to invite a
++        // dragged file).
++        let ownOutline = (phase.showsScreenGlow && !joinsScreenGlow) || phase.isFileDrop
++
++        return VStack(spacing: 0) {
+             mainRow(phase: phase, size: size, topRadius: shape.topCornerRadius)
+             liveTextPanel(phase: phase)
+             assistantPanel(phase: phase)
++            dropPanel(phase: phase)
+         }
+         .frame(width: size.width, height: size.height, alignment: .top)
+         .background(Color.black)
+@@ -94,33 +108,35 @@ struct NotchIslandView: View {
+         // the island instead.
+         .overlay {
+             rim(phase: phase, shape: shape)
+-                .opacity(phase.showsScreenGlow && !joinsScreenGlow ? 1 : 0)
++                .opacity(ownOutline ? 1 : 0)
+         }
+         .background {
+             NotchIslandGlow(
+                 phase: phase,
+                 shape: shape,
+-                isOn: phase.showsScreenGlow && !joinsScreenGlow,
++                isOn: ownOutline,
+                 meter: { recorder.audioMeterSnapshot() }
+             )
+         }
++        // Lets the window take part in drags right away; the fields below do the actual work.
++        .onDrop(of: [UTType.fileURL], isTargeted: nil) { _ in false }
+         .opacity(phase == .hidden ? 0 : 1)
+     }
+ 
+-    static func shape(for phase: NotchIslandPhase) -> NotchShape {
++    static func shape(for phase: NotchIslandPhase) -> NotchIslandShape {
+         switch phase {
+         case .hidden, .idle:
+-            return NotchShape(topCornerRadius: 4, bottomCornerRadius: 8)
+-        case .hover, .menu, .recording, .processing:
+-            return NotchShape(topCornerRadius: 8, bottomCornerRadius: 14)
+-        case .liveText, .assistant:
+-            return NotchShape(topCornerRadius: 12, bottomCornerRadius: 22)
++            return NotchIslandShape(topCornerRadius: 4, bottomCornerRadius: 8)
++        case .hover, .menu, .recording, .processing, .music, .dropReady, .fileTask:
++            return NotchIslandShape(topCornerRadius: 8, bottomCornerRadius: 14)
++        case .liveText, .assistant, .dropTarget:
++            return NotchIslandShape(topCornerRadius: 12, bottomCornerRadius: 22)
+         }
+     }
+ 
+     /// Sides and bottom only (a line along the top screen edge would show where the hardware
+     /// notch is), fading out towards the top.
+-    private func rim(phase: NotchIslandPhase, shape: NotchShape) -> some View {
++    private func rim(phase: NotchIslandPhase, shape: NotchIslandShape) -> some View {
+         let color = phase == .processing
+             ? NotchIslandGlow.processingColor.opacity(0.6)
+             : NotchIslandGlow.recordingColor.opacity(0.85)
+@@ -155,13 +171,15 @@ struct NotchIslandView: View {
+         .contentShape(Rectangle())
+         .onTapGesture {
+             switch phase {
+-            case .hidden, .idle, .hover:
++            case .hidden, .idle, .hover, .music:
+                 model.openMenu()
+             case .menu:
+                 model.closeMenu()
+             case .recording, .liveText:
+                 onTap()
+-            case .processing, .assistant:
++            case .fileTask:
++                onDismissFileTask()
++            case .processing, .assistant, .dropReady, .dropTarget:
+                 break
+             }
+         }
+@@ -171,10 +189,22 @@ struct NotchIslandView: View {
+     private func leftWing(phase: NotchIslandPhase) -> some View {
+         Group {
+             switch phase {
++            case .music:
++                NotchMusicArtwork(nowPlaying: model.nowPlaying, size: 22, cornerRadius: 6)
+             case .hover, .menu:
+-                Image(systemName: "mic.fill")
++                if model.music != nil {
++                    NotchMusicArtwork(nowPlaying: model.nowPlaying, size: 22, cornerRadius: 6)
++                } else {
++                    Image(systemName: "mic.fill")
++                        .font(.system(size: 11, weight: .semibold))
++                        .foregroundStyle(Color.white.opacity(0.9))
++                }
++            case .dropReady, .dropTarget:
++                draggedFileIcon
++            case .fileTask:
++                Image(systemName: model.fileTask?.kind == .mp3 ? "music.note" : "text.bubble.fill")
+                     .font(.system(size: 11, weight: .semibold))
+-                    .foregroundStyle(Color.white.opacity(0.9))
++                    .foregroundStyle(NotchIslandStyle.gold)
+             case .recording, .liveText, .processing:
+                 targetAppBadge(phase: phase)
+             case .assistant:
+@@ -191,6 +221,20 @@ struct NotchIslandView: View {
+         .animation(.easeOut(duration: 0.18).delay(0.06), value: phase)
+     }
+ 
++    @ViewBuilder
++    private var draggedFileIcon: some View {
++        if let url = model.fileDrag?.urls.first {
++            Image(nsImage: NSWorkspace.shared.icon(forFile: url.path))
++                .resizable()
++                .interpolation(.high)
++                .frame(width: 20, height: 20)
++        } else {
++            Image(systemName: "doc.fill")
++                .font(.system(size: 11, weight: .semibold))
++                .foregroundStyle(Color.white.opacity(0.9))
++        }
++    }
++
+     @ViewBuilder
+     private func targetAppBadge(phase: NotchIslandPhase) -> some View {
+         if let icon = model.targetAppIcon {
+@@ -209,10 +253,26 @@ struct NotchIslandView: View {
+     private func rightWing(phase: NotchIslandPhase, rowHeight: CGFloat) -> some View {
+         Group {
+             switch phase {
++            case .music:
++                NotchMusicBars(isPlaying: model.music?.isPlaying == true)
+             case .hover, .menu:
+-                Image(systemName: "waveform")
+-                    .font(.system(size: 10, weight: .semibold))
+-                    .foregroundStyle(Color.white.opacity(0.55))
++                if let music = model.music {
++                    NotchMusicBars(isPlaying: music.isPlaying)
++                } else {
++                    Image(systemName: "waveform")
++                        .font(.system(size: 10, weight: .semibold))
++                        .foregroundStyle(Color.white.opacity(0.55))
++                }
++            case .dropReady, .dropTarget:
++                dropCount
++            case .fileTask:
++                if model.fileTask?.isFinished == false {
++                    NotchIslandProcessingDots()
++                } else {
++                    Image(systemName: fileTaskSymbol)
++                        .font(.system(size: 12, weight: .semibold))
++                        .foregroundStyle(NotchIslandStyle.gold)
++                }
+             case .recording, .liveText:
+                 NotchIslandWaveform(
+                     meter: { recorder.audioMeterSnapshot() },
+@@ -235,6 +295,27 @@ struct NotchIslandView: View {
+         .animation(.easeOut(duration: 0.18).delay(0.06), value: phase)
+     }
+ 
++    @ViewBuilder
++    private var dropCount: some View {
++        let count = model.fileDrag?.urls.count ?? 0
++        if count > 1 {
++            Text(verbatim: String(count))
++                .font(.system(size: 10.5, weight: .bold))
++                .foregroundStyle(NotchIslandStyle.navy)
++                .frame(minWidth: 18, minHeight: 18)
++                .background(Circle().fill(NotchIslandStyle.gold))
++        } else {
++            Image(systemName: "arrow.down")
++                .font(.system(size: 11, weight: .bold))
++                .foregroundStyle(NotchIslandStyle.gold)
++        }
++    }
++
++    private var fileTaskSymbol: String {
++        if case .failed = model.fileTask?.state { return "exclamationmark" }
++        return "checkmark"
++    }
++
+     // MARK: - Panels below the notch
+ 
+     @ViewBuilder
+@@ -251,6 +332,15 @@ struct NotchIslandView: View {
+         }
+     }
+ 
++    @ViewBuilder
++    private func dropPanel(phase: NotchIslandPhase) -> some View {
++        if phase == .dropTarget {
++            NotchDropZones(drag: model.fileDrag, onDrop: onFileDrop)
++                .frame(height: NotchIslandModel.dropPanelHeight)
++                .transition(.opacity)
++        }
++    }
++
+     @ViewBuilder
+     private func assistantPanel(phase: NotchIslandPhase) -> some View {
+         if phase == .assistant {
+@@ -305,8 +395,17 @@ struct NotchMenuCard: View {
+ 
+     var body: some View {
+         let content = makeContent()
++        let size = model.music != nil ? NotchIslandModel.musicMenuCardSize : NotchIslandModel.menuCardSize
+ 
+         VStack(alignment: .leading, spacing: 0) {
++            if let music = model.music {
++                NotchMusicSection(track: music, nowPlaying: model.nowPlaying)
++                Rectangle()
++                    .fill(Color.white.opacity(0.12))
++                    .frame(height: 1)
++                    .padding(.vertical, 12)
++            }
++
+             HStack(spacing: 6) {
+                 ForEach(NotchLanguageOption.all) { option in
+                     languageChip(option)
+@@ -340,11 +439,7 @@ struct NotchMenuCard: View {
+             .padding(.top, 6)
+         }
+         .padding(14)
+-        .frame(
+-            width: NotchIslandModel.menuCardSize.width,
+-            height: NotchIslandModel.menuCardSize.height,
+-            alignment: .topLeading
+-        )
++        .frame(width: size.width, height: size.height, alignment: .topLeading)
+         .notchGlassCard(cornerRadius: 22)
+         .environment(\.colorScheme, .dark)
+     }
+@@ -510,9 +605,324 @@ struct NotchMenuCard: View {
+     }
+ }
+ 
+-// MARK: - Island outline without the top edge
++// MARK: - Music
+ 
+-struct NotchIslandRimShape: Shape {
++/// Cover, title and the buttons, at the top of the menu card while music plays.
++struct NotchMusicSection: View {
++    let track: NotchNowPlaying.Track
++    @ObservedObject var nowPlaying: NotchNowPlaying
++
++    var body: some View {
++        HStack(spacing: 12) {
++            NotchMusicArtwork(nowPlaying: nowPlaying, size: 46, cornerRadius: 10)
++
++            VStack(alignment: .leading, spacing: 3) {
++                Text(verbatim: track.title)
++                    .font(.system(size: 13, weight: .semibold))
++                    .foregroundStyle(Color.white)
++                    .lineLimit(1)
++                Text(verbatim: track.artist)
++                    .font(.system(size: 11.5))
++                    .foregroundStyle(Color.white.opacity(0.6))
++                    .lineLimit(1)
++            }
++
++            Spacer(minLength: 8)
++
++            HStack(spacing: 6) {
++                controlButton(symbol: "backward.fill", size: 12) { nowPlaying.previous() }
++                controlButton(symbol: track.isPlaying ? "pause.fill" : "play.fill", size: 15, prominent: true) {
++                    nowPlaying.playPause()
++                }
++                controlButton(symbol: "forward.fill", size: 12) { nowPlaying.next() }
++            }
++        }
++        .frame(height: 46)
++    }
++
++    private func controlButton(
++        symbol: String,
++        size: CGFloat,
++        prominent: Bool = false,
++        action: @escaping () -> Void
++    ) -> some View {
++        Button(action: action) {
++            Image(systemName: symbol)
++                .font(.system(size: size, weight: .bold))
++                .foregroundStyle(prominent ? NotchIslandStyle.navy : Color.white.opacity(0.9))
++                .frame(width: prominent ? 36 : 30, height: prominent ? 36 : 30)
++                .background(Circle().fill(prominent ? NotchIslandStyle.gold : Color.white.opacity(0.1)))
++                .contentShape(Circle())
++        }
++        .buttonStyle(.plain)
++    }
++}
++
++/// Album cover, or a note while there is none.
++struct NotchMusicArtwork: View {
++    @ObservedObject var nowPlaying: NotchNowPlaying
++    let size: CGFloat
++    let cornerRadius: CGFloat
++
++    var body: some View {
++        ZStack {
++            if let artwork = nowPlaying.artwork {
++                Image(nsImage: artwork)
++                    .resizable()
++                    .interpolation(.high)
++                    .aspectRatio(contentMode: .fill)
++            } else {
++                Color.white.opacity(0.12)
++                Image(systemName: "music.note")
++                    .font(.system(size: size * 0.45, weight: .semibold))
++                    .foregroundStyle(NotchIslandStyle.gold)
++            }
++        }
++        .frame(width: size, height: size)
++        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
++        .animation(.easeOut(duration: 0.25), value: nowPlaying.artwork != nil)
++    }
++}
++
++/// Small gold bars that move while music plays.
++struct NotchMusicBars: View {
++    let isPlaying: Bool
++
++    private static let speeds: [Double] = [5.3, 7.1, 6.2, 8.3]
++
++    var body: some View {
++        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isPlaying)) { context in
++            let time = context.date.timeIntervalSinceReferenceDate
++            HStack(alignment: .center, spacing: 2) {
++                ForEach(0..<4, id: \.self) { index in
++                    Capsule()
++                        .fill(NotchIslandStyle.gold)
++                        .frame(width: 2.5, height: barHeight(index: index, time: time))
++                }
++            }
++            .frame(height: 14)
++        }
++    }
++
++    private func barHeight(index: Int, time: TimeInterval) -> CGFloat {
++        guard isPlaying else { return 3 }
++        let wave = (sin(time * Self.speeds[index] + Double(index) * 1.3) + 1) / 2
++        return 4 + CGFloat(wave) * 10
++    }
++}
++
++// MARK: - File drop
++
++/// The fields a dragged file can be dropped on: transcribe, convert to MP3, AirDrop.
++struct NotchDropZones: View {
++    let drag: NotchFileDrag?
++    let onDrop: (NotchDropAction) -> Void
++
++    var body: some View {
++        HStack(spacing: 8) {
++            NotchDropZone(
++                symbol: "text.bubble.fill",
++                title: Text("Transcribe", tableName: "NotchIsland"),
++                isEnabled: drag?.canTranscribe ?? false
++            ) { onDrop(.transcribe) }
++            NotchDropZone(
++                symbol: "music.note",
++                title: Text(verbatim: "MP3"),
++                isEnabled: drag?.canConvert ?? false
++            ) { onDrop(.mp3) }
++            NotchDropZone(
++                symbol: "dot.radiowaves.left.and.right",
++                title: Text(verbatim: "AirDrop"),
++                isEnabled: drag != nil
++            ) { onDrop(.airDrop) }
++        }
++        .padding(.horizontal, 12)
++        .padding(.top, 4)
++        .padding(.bottom, 12)
++    }
++}
++
++struct NotchDropZone: View {
++    let symbol: String
++    let title: Text
++    let isEnabled: Bool
++    let action: () -> Void
++
++    @State private var isTargeted = false
++
++    var body: some View {
++        let active = isEnabled && isTargeted
++        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
++
++        VStack(spacing: 6) {
++            Image(systemName: symbol)
++                .font(.system(size: 17, weight: .semibold))
++            title
++                .font(.system(size: 11, weight: .semibold))
++                .lineLimit(1)
++        }
++        .foregroundStyle(active ? NotchIslandStyle.navy : Color.white.opacity(isEnabled ? 0.9 : 0.3))
++        .frame(maxWidth: .infinity, maxHeight: .infinity)
++        .background(shape.fill(active ? NotchIslandStyle.gold : Color.white.opacity(isEnabled ? 0.08 : 0.03)))
++        .overlay(
++            shape.strokeBorder(
++                NotchIslandStyle.gold.opacity(isEnabled && !active ? 0.4 : 0),
++                style: StrokeStyle(lineWidth: 1, dash: [4, 3])
++            )
++        )
++        .scaleEffect(active ? 1.04 : 1)
++        .animation(.easeOut(duration: 0.15), value: active)
++        .contentShape(shape)
++        .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted) { _ in
++            guard isEnabled else { return false }
++            action()
++            return true
++        }
++    }
++}
++
++/// Card below the notch while a dropped file is processed, and with the result.
++struct NotchFileTaskCard: View {
++    let task: NotchFileTask
++    let onDismiss: () -> Void
++
++    @State private var copied = false
++
++    var body: some View {
++        HStack(alignment: .top, spacing: 12) {
++            statusIcon
++                .frame(width: 26, height: 26)
++
++            VStack(alignment: .leading, spacing: 4) {
++                title
++                    .font(.system(size: 12.5, weight: .semibold))
++                    .foregroundStyle(Color.white)
++                    .lineLimit(1)
++                Text(verbatim: detail)
++                    .font(.system(size: 11.5))
++                    .foregroundStyle(Color.white.opacity(0.65))
++                    .lineLimit(2)
++                    .frame(maxWidth: .infinity, alignment: .leading)
++            }
++
++            VStack(alignment: .trailing, spacing: 8) {
++                Button(action: onDismiss) {
++                    Image(systemName: "xmark")
++                        .font(.system(size: 9, weight: .bold))
++                        .foregroundStyle(Color.white.opacity(0.7))
++                        .frame(width: 20, height: 20)
++                        .background(Circle().fill(Color.white.opacity(0.1)))
++                        .contentShape(Circle())
++                }
++                .buttonStyle(.plain)
++
++                actionButton
++            }
++        }
++        .padding(14)
++        .frame(
++            width: NotchIslandModel.fileTaskCardSize.width,
++            height: NotchIslandModel.fileTaskCardSize.height,
++            alignment: .topLeading
++        )
++        .notchGlassCard(cornerRadius: 22)
++        .environment(\.colorScheme, .dark)
++    }
++
++    @ViewBuilder
++    private var statusIcon: some View {
++        switch task.state {
++        case .working:
++            ProgressView()
++                .progressViewStyle(.circular)
++                .controlSize(.small)
++        case .transcript, .saved:
++            Image(systemName: "checkmark.circle.fill")
++                .font(.system(size: 22))
++                .foregroundStyle(NotchIslandStyle.gold)
++        case .failed:
++            Image(systemName: "exclamationmark.triangle.fill")
++                .font(.system(size: 19))
++                .foregroundStyle(Color.orange)
++        }
++    }
++
++    private var title: Text {
++        switch task.state {
++        case .working:
++            return task.kind == .mp3
++                ? Text("Converting to MP3…", tableName: "NotchIsland")
++                : Text("Transcribing…", tableName: "NotchIsland")
++        case .transcript:
++            return Text("Transcript copied", tableName: "NotchIsland")
++        case .saved:
++            return Text("MP3 saved", tableName: "NotchIsland")
++        case .failed:
++            return Text("Failed", tableName: "NotchIsland")
++        }
++    }
++
++    private var detail: String {
++        switch task.state {
++        case .working:
++            return task.fileName
++        case .transcript(let text):
++            return text
++        case .saved(let url):
++            return url.lastPathComponent
++        case .failed(let message):
++            return message
++        }
++    }
++
++    @ViewBuilder
++    private var actionButton: some View {
++        switch task.state {
++        case .transcript(let text):
++            pillButton(symbol: copied ? "checkmark" : "doc.on.doc", title: copied
++                ? Text("Copied", tableName: "NotchIsland")
++                : Text("Copy", tableName: "NotchIsland")
++            ) {
++                guard ClipboardManager.copyToClipboard(text) else { return }
++                copied = true
++                Task { @MainActor in
++                    try? await Task.sleep(nanoseconds: 1_600_000_000)
++                    copied = false
++                }
++            }
++        case .saved(let url):
++            pillButton(symbol: "folder", title: Text("Show in Finder", tableName: "NotchIsland")) {
++                NSWorkspace.shared.activateFileViewerSelecting([url])
++            }
++        case .working, .failed:
++            EmptyView()
++        }
++    }
++
++    private func pillButton(symbol: String, title: Text, action: @escaping () -> Void) -> some View {
++        Button(action: action) {
++            HStack(spacing: 4) {
++                Image(systemName: symbol)
++                    .font(.system(size: 9.5, weight: .bold))
++                title
++                    .font(.system(size: 11, weight: .semibold))
++                    .lineLimit(1)
++            }
++            .foregroundStyle(Color.white)
++            .padding(.horizontal, 10)
++            .frame(height: 24)
++            .background(Capsule().fill(Color.white.opacity(0.16)))
++            .contentShape(Capsule())
++        }
++        .buttonStyle(.plain)
++    }
++}
++
++// MARK: - Island shape
++
++/// The island: flat along the top screen edge with a small outward curve into it, rounded at the
++/// bottom. Made of circular arcs, exactly the outline the screen glow computes around it.
++struct NotchIslandShape: Shape {
+     var topCornerRadius: CGFloat
+     var bottomCornerRadius: CGFloat
+ 
+@@ -525,35 +935,83 @@ struct NotchIslandRimShape: Shape {
+     }
+ 
+     func path(in rect: CGRect) -> Path {
+-        let top = topCornerRadius
+-        let bottom = bottomCornerRadius
++        Self.outline(in: rect, top: topCornerRadius, bottom: bottomCornerRadius, closed: true)
++    }
++
++    /// Radii limited to what fits (the glow shader uses the same limits).
++    static func radii(width: CGFloat, height: CGFloat, top: CGFloat, bottom: CGFloat) -> (top: CGFloat, bottom: CGFloat) {
++        let topRadius = max(0, min(top, width / 2, height))
++        let halfWidth = max(width / 2 - topRadius, 0)
++        let bottomRadius = max(0, min(bottom, halfWidth, max(height - topRadius, 0)))
++        return (topRadius, bottomRadius)
++    }
++
++    /// Outline from the top-left screen edge around the island to the top-right; closed along
++    /// the top edge for the filled island.
++    static func outline(in rect: CGRect, top: CGFloat, bottom: CGFloat, closed: Bool) -> Path {
+         var path = Path()
+-        // Starts right at the top screen edge (where the screen glow runs) and follows the
+-        // island's outward-curved top corner, so both lines meet without a gap.
++        guard rect.width > 0, rect.height > 0 else { return path }
++        let limited = Self.radii(width: rect.width, height: rect.height, top: top, bottom: bottom)
++        let left = rect.minX + limited.top
++        let right = rect.maxX - limited.top
++
+         path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+-        path.addQuadCurve(
+-            to: CGPoint(x: rect.minX + top, y: rect.minY + top),
+-            control: CGPoint(x: rect.minX + top, y: rect.minY)
+-        )
+-        path.addLine(to: CGPoint(x: rect.minX + top, y: rect.maxY - bottom))
+-        path.addQuadCurve(
+-            to: CGPoint(x: rect.minX + top + bottom, y: rect.maxY),
+-            control: CGPoint(x: rect.minX + top, y: rect.maxY)
+-        )
+-        path.addLine(to: CGPoint(x: rect.maxX - top - bottom, y: rect.maxY))
+-        path.addQuadCurve(
+-            to: CGPoint(x: rect.maxX - top, y: rect.maxY - bottom),
+-            control: CGPoint(x: rect.maxX - top, y: rect.maxY)
+-        )
+-        path.addLine(to: CGPoint(x: rect.maxX - top, y: rect.minY + top))
+-        path.addQuadCurve(
+-            to: CGPoint(x: rect.maxX, y: rect.minY),
+-            control: CGPoint(x: rect.maxX - top, y: rect.minY)
+-        )
++        if limited.top > 0 {
++            path.addArc(
++                tangent1End: CGPoint(x: left, y: rect.minY),
++                tangent2End: CGPoint(x: left, y: rect.maxY),
++                radius: limited.top
++            )
++        }
++        if limited.bottom > 0 {
++            path.addArc(
++                tangent1End: CGPoint(x: left, y: rect.maxY),
++                tangent2End: CGPoint(x: right, y: rect.maxY),
++                radius: limited.bottom
++            )
++            path.addArc(
++                tangent1End: CGPoint(x: right, y: rect.maxY),
++                tangent2End: CGPoint(x: right, y: rect.minY),
++                radius: limited.bottom
++            )
++        } else {
++            path.addLine(to: CGPoint(x: left, y: rect.maxY))
++            path.addLine(to: CGPoint(x: right, y: rect.maxY))
++        }
++        if limited.top > 0 {
++            path.addArc(
++                tangent1End: CGPoint(x: right, y: rect.minY),
++                tangent2End: CGPoint(x: rect.maxX, y: rect.minY),
++                radius: limited.top
++            )
++        }
++        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
++        if closed {
++            path.closeSubpath()
++        }
+         return path
+     }
+ }
+ 
++/// The island's outline without the top edge (a line along the top would show where the
++/// hardware notch is). Only used when the screen glow is off.
++struct NotchIslandRimShape: Shape {
++    var topCornerRadius: CGFloat
++    var bottomCornerRadius: CGFloat
++
++    var animatableData: AnimatablePair<CGFloat, CGFloat> {
++        get { AnimatablePair(topCornerRadius, bottomCornerRadius) }
++        set {
++            topCornerRadius = newValue.first
++            bottomCornerRadius = newValue.second
++        }
++    }
++
++    func path(in rect: CGRect) -> Path {
++        NotchIslandShape.outline(in: rect, top: topCornerRadius, bottom: bottomCornerRadius, closed: false)
++    }
++}
++
+ // MARK: - Island glow
+ 
+ struct NotchIslandGlow: View {
+@@ -561,7 +1019,7 @@ struct NotchIslandGlow: View {
+     static let processingColor = NotchIslandStyle.silver
+ 
+     let phase: NotchIslandPhase
+-    let shape: NotchShape
++    let shape: NotchIslandShape
+     let isOn: Bool
+     let meter: () -> AudioMeter
+ 
+diff --git a/VoiceInk/Info.plist b/VoiceInk/Info.plist
+index 4d98a62..66d6324 100644
+--- a/VoiceInk/Info.plist
++++ b/VoiceInk/Info.plist
+@@ -17,7 +17,7 @@
+ 	<key>NSMicrophoneUsageDescription</key>
+ 	<string>VoiceInk needs access to your microphone to record audio for transcription.</string>
+ 	<key>NSAppleEventsUsageDescription</key>
+-	<string>VoiceInk needs to interact with your browser to detect the current website for applying website-specific configurations.</string>
++	<string>VoiceInk needs to interact with your browser to detect the current website for applying website-specific configurations, and with Spotify or Music to show and control what is playing in the notch.</string>
+ 	<key>NSScreenCaptureUsageDescription</key>
+ 	<string>VoiceInk needs screen recording access to understand context from your screen for improved transcription accuracy.</string>
+ 	<key>CFBundleDocumentTypes</key>
+diff --git a/VoiceInk/InfoPlist.xcstrings b/VoiceInk/InfoPlist.xcstrings
+index e511704..9e453b9 100644
+--- a/VoiceInk/InfoPlist.xcstrings
++++ b/VoiceInk/InfoPlist.xcstrings
+@@ -115,13 +115,13 @@
+         "de" : {
+           "stringUnit" : {
+             "state" : "translated",
+-            "value" : "VoiceInk muss mit Ihrem Browser interagieren, um die aktuelle Website zu erkennen und website-spezifische Konfigurationen anzuwenden."
++            "value" : "VoiceInk muss mit Ihrem Browser interagieren, um die aktuelle Website zu erkennen und website-spezifische Konfigurationen anzuwenden, und mit Spotify oder Musik, um in der Notch anzuzeigen und zu steuern, was gerade läuft."
+           }
+         },
+         "en" : {
+           "stringUnit" : {
+             "state" : "new",
+-            "value" : "VoiceInk needs to interact with your browser to detect the current website for applying website-specific configurations."
++            "value" : "VoiceInk needs to interact with your browser to detect the current website for applying website-specific configurations, and with Spotify or Music to show and control what is playing in the notch."
+           }
+         },
+         "zh-Hans" : {
+@@ -133,7 +133,7 @@
+         "fr" : {
+           "stringUnit" : {
+             "state" : "translated",
+-            "value" : "VoiceInk doit interagir avec votre navigateur pour détecter le site Web actuel afin d'appliquer des configurations spécifiques au site Web."
++            "value" : "VoiceInk doit interagir avec votre navigateur pour détecter le site Web actuel afin d'appliquer des configurations spécifiques au site Web, et avec Spotify ou Musique pour afficher et contrôler la lecture dans l'encoche."
+           }
+         },
+         "ja" : {
+diff --git a/VoiceInk/NotchIsland.xcstrings b/VoiceInk/NotchIsland.xcstrings
+index 74c250e..6883d45 100644
+--- a/VoiceInk/NotchIsland.xcstrings
++++ b/VoiceInk/NotchIsland.xcstrings
+@@ -1,6 +1,22 @@
+ {
+   "sourceLanguage" : "en",
+   "strings" : {
++    "AirDrop is not available." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "AirDrop ist nicht verfügbar."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "AirDrop n’est pas disponible."
++          }
++        }
++      }
++    },
+     "Canceled" : {
+       "localizations" : {
+         "de" : {
+@@ -33,6 +49,38 @@
+         }
+       }
+     },
++    "Choose a mode in VoiceInk first." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Wähle zuerst einen Modus in VoiceInk."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Choisissez d’abord un mode dans VoiceInk."
++          }
++        }
++      }
++    },
++    "Converting to MP3…" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Wird in MP3 umgewandelt …"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Conversion en MP3…"
++          }
++        }
++      }
++    },
+     "Copied" : {
+       "localizations" : {
+         "de" : {
+@@ -81,6 +129,22 @@
+         }
+       }
+     },
++    "Failed" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Fehlgeschlagen"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Échec"
++          }
++        }
++      }
++    },
+     "Failed - Live Text" : {
+       "localizations" : {
+         "de" : {
+@@ -97,6 +161,22 @@
+         }
+       }
+     },
++    "ffmpeg was not found. Open VideoLoader once, or install ffmpeg with Homebrew." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "ffmpeg wurde nicht gefunden. Öffne VideoLoader einmal oder installiere ffmpeg mit Homebrew."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "ffmpeg est introuvable. Ouvrez VideoLoader une fois ou installez ffmpeg avec Homebrew."
++          }
++        }
++      }
++    },
+     "Four-Finger Tap to Dictate" : {
+       "localizations" : {
+         "de" : {
+@@ -145,6 +225,22 @@
+         }
+       }
+     },
++    "MP3 saved" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "MP3 gespeichert"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "MP3 enregistré"
++          }
++        }
++      }
++    },
+     "Nothing dictated yet." : {
+       "localizations" : {
+         "de" : {
+@@ -161,6 +257,22 @@
+         }
+       }
+     },
++    "Nothing was recognized." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Es wurde nichts erkannt."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Rien n’a été reconnu."
++          }
++        }
++      }
++    },
+     "Retry" : {
+       "localizations" : {
+         "de" : {
+@@ -193,6 +305,22 @@
+         }
+       }
+     },
++    "Show in Finder" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Im Finder zeigen"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Afficher dans le Finder"
++          }
++        }
++      }
++    },
+     "Still being processed…" : {
+       "localizations" : {
+         "de" : {
+@@ -257,6 +385,86 @@
+         }
+       }
+     },
++    "The file could not be converted." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Die Datei konnte nicht umgewandelt werden."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Le fichier n’a pas pu être converti."
++          }
++        }
++      }
++    },
++    "These files are already being transcribed." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Diese Dateien werden bereits transkribiert."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Ces fichiers sont déjà en cours de transcription."
++          }
++        }
++      }
++    },
++    "Transcribe" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Transkribieren"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Transcrire"
++          }
++        }
++      }
++    },
++    "Transcribing…" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Wird transkribiert …"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Transcription…"
++          }
++        }
++      }
++    },
++    "Transcript copied" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Transkript kopiert"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Transcription copiée"
++          }
++        }
++      }
++    },
+     "Transcription Failed" : {
+       "localizations" : {
+         "de" : {
