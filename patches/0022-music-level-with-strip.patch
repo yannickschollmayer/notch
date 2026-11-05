@@ -1,0 +1,28 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index 03c5ca9..a8fc578 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -372,3 +372,4 @@ final class NotchIslandModel: ObservableObject {
+         switch phase {
+-        case .hidden, .idle: return geometry.notchHeight
++        // Music sits level with the black strip beside the notch.
++        case .hidden, .idle, .music: return geometry.notchHeight
+         default: return geometry.notchHeight + Self.rowBonus
+@@ -398,3 +399,6 @@ final class NotchIslandModel: ObservableObject {
+             return CGSize(width: width + Self.assistantWing * 2, height: row + Self.assistantPanelHeight)
+-        case .music, .shelfPeek:
++        case .music:
++            // Exactly as tall as the black strip beside the notch, so the two run into each other.
++            return CGSize(width: width + Self.musicWing * 2, height: height)
++        case .shelfPeek:
+             return CGSize(width: width + Self.musicWing * 2, height: row)
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 980dc17..fdee3ff 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -137,3 +137,4 @@ struct NotchIslandView: View {
+         // Without light around it, a soft dark shadow sets the opened island off from what is behind.
+-        let shadowed = !glowAround && !ownOutline && phase != .hidden && phase != .idle
++        // Not while music plays either: then the island lies flat in the black strip.
++        let shadowed = !glowAround && !ownOutline && phase != .hidden && phase != .idle && phase != .music
+         // Not while the screen glow runs around the island: that line would not follow.
