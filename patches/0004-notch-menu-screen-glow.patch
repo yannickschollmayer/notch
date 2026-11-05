@@ -1,0 +1,1371 @@
+diff --git a/VoiceInk/Core/Enhancement/AIPrompts.swift b/VoiceInk/Core/Enhancement/AIPrompts.swift
+index dbefc23..332e1ba 100644
+--- a/VoiceInk/Core/Enhancement/AIPrompts.swift
++++ b/VoiceInk/Core/Enhancement/AIPrompts.swift
+@@ -16,6 +16,7 @@ enum AIPrompts {
+         - Detect quotations automatically. When the speaker repeats someone’s or something’s exact words (direct speech after verbs such as said, wrote, asked, replied, “gesagt”, “meinte”, “schrieb”, “fragte”, “a dit”, “dijo”; or the exact text of a message, error, sign, title, or slogan), put those exact words in quotation marks. Signs of direct speech include a switch to first person or to the quoted person’s own wording.
+         - Do not add quotation marks to indirect or reported speech (for example “Er sagte, dass er später kommt”, “Sie meinte, sie komme später”, “He said he would be late”).
+         - Spoken quote markers such as “quote … end quote”, “quote … unquote”, “Zitat … Zitat Ende”, “Anführungszeichen … Anführungszeichen zu / Ende”, “entre guillemets … fin de citation”, “comillas … cierro comillas” or “cita … fin de la cita” mark the start and end of a quotation: remove the markers and put the enclosed words in quotation marks. If no end marker is spoken, end the quotation where the quoted sentence naturally ends.
++        - Put the names of on-screen elements the speaker refers to in quotation marks, written as they appear on screen with a capital first letter: buttons, menu items, tabs, links, settings, options, fields, and window, file, or channel titles. They typically follow verbs such as “click on”, “tap”, “select”, “choose”, “open”, “go to”, “klick auf”, “klicken auf”, “tippe auf”, “drück auf”, “wähle”, “öffne”, “geh auf”, “cliquez sur”, “sélectionnez”, “haz clic en”, “pulsa”, “selecciona”. Use <CURRENT_WINDOW_CONTEXT> to match the exact label when it is visible there. Do not quote ordinary objects that are not labels (for example “klick auf den Link”, “open the file”).
+         - Use the quotation marks of the transcript’s language: German „…“ (nested ‚…‘), English “…” (nested ‘…’), French « … » with spaces inside, Spanish «…» (nested “…”). In German, introduce direct speech with a colon after the speech verb and capitalize its first word (Er sagte: „Ich komme morgen.“).
+         - Write clear spoken numbers as digits, except small numbers that read more naturally as words. Use standard forms for dates, times, currencies, percentages, measurements, phone numbers, email addresses, URLs, code, filenames, and file paths. Never guess unclear values.
+         - Use readable paragraphs. Start a new paragraph when the speaker moves to a new idea, question, topic, or tone. Keep paragraphs to no more than three sentences or about 40 words, whichever is shorter.
+@@ -62,6 +63,15 @@ enum AIPrompts {
+ 
+         Input: She told me quote we ship on Monday end quote so plan accordingly
+         Output: She told me, “We ship on Monday,” so plan accordingly.
++
++        Input: Ich würde einfach auf neuen Kanal erstellen klicken
++        Output: Ich würde einfach auf „Neuen Kanal erstellen“ klicken.
++
++        Input: Klick oben rechts auf teilen und dann auf link kopieren
++        Output: Klick oben rechts auf „Teilen“ und dann auf „Link kopieren“.
++
++        Input: Click on save changes and then on publish
++        Output: Click on “Save changes” and then on “Publish”.
+         </EXAMPLES>
+ 
+         <OUTPUT_REQUIREMENTS>
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index 6e0b527..2cc8974 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -1,8 +1,27 @@
+ import AppKit
+ import Combine
++import SwiftData
+ import SwiftUI
+ import os
+ 
++// MARK: - Settings
++
++enum NotchIslandSettings {
++    /// The edges of the screen light up while dictating (Siri style).
++    static let screenGlowKey = "NotchScreenGlowEnabled"
++
++    static var screenGlowEnabled: Bool {
++        UserDefaults.standard.object(forKey: screenGlowKey) as? Bool ?? true
++    }
++}
++
++/// The most recent dictation, shown in the notch menu so it can be copied again.
++struct NotchLastDictation: Equatable {
++    let text: String
++    let date: Date
++    let status: TranscriptionStatus
++}
++
+ // MARK: - Geometry
+ 
+ /// Size of the hardware notch (or a virtual one on displays without a notch).
+@@ -49,8 +68,10 @@ enum NotchIslandPhase: Equatable {
+     case hidden
+     /// Sits invisibly behind the hardware notch.
+     case idle
+-    /// Pointer is on the notch: grows a little and can be clicked to start dictating.
++    /// Pointer is on the notch: grows a little and can be clicked to open the menu.
+     case hover
++    /// Opened by a click: language choice and the last dictation to copy.
++    case menu
+     /// Listening. Slightly larger than the notch and glowing.
+     case recording
+     /// Transcribing / AI clean-up.
+@@ -63,7 +84,15 @@ enum NotchIslandPhase: Equatable {
+     var isActive: Bool {
+         switch self {
+         case .recording, .processing, .liveText, .assistant: return true
+-        case .hidden, .idle, .hover: return false
++        case .hidden, .idle, .hover, .menu: return false
++        }
++    }
++
++    /// Phases in which the edges of the screen light up.
++    var showsScreenGlow: Bool {
++        switch self {
++        case .recording, .liveText, .processing: return true
++        case .hidden, .idle, .hover, .menu, .assistant: return false
+         }
+     }
+ }
+@@ -79,31 +108,59 @@ final class NotchIslandModel: ObservableObject {
+     @Published private(set) var recordingState: RecordingState = .idle
+     @Published private(set) var partialTranscript = ""
+     @Published private(set) var assistantVisible = false
+-
++    /// The click menu (language + last dictation) is open.
++    @Published private(set) var menuOpen = false
++    /// Latest streaming text of the current or last recording. Kept after the recording ends,
++    /// so it can still be copied when the final transcription fails.
++    @Published private(set) var lastLiveText = ""
++    @Published private(set) var lastDictation: NotchLastDictation?
++
++    private let modelContext: ModelContext
+     private var cancellables = Set<AnyCancellable>()
+ 
+     // Extra width on each side of the notch and extra height below it, per phase.
+     static let hoverWing: CGFloat = 22
+     static let activeWing: CGFloat = 50
+     static let liveTextWing: CGFloat = 110
++    static let menuWing: CGFloat = 170
+     static let assistantWing: CGFloat = 230
+     static let rowBonus: CGFloat = 5
+     static let liveTextPanelHeight: CGFloat = 57
++    static let menuPanelHeight: CGFloat = 158
+     static let assistantPanelHeight: CGFloat = 320
+     /// Room around the island for the glow.
+     static let glowPadding: CGFloat = 34
+ 
+     init(engine: VoiceInkEngine, geometry: NotchGeometry) {
+         self.geometry = geometry
++        self.modelContext = engine.modelContext
+ 
+         engine.$recordingState
+             .removeDuplicates()
+-            .sink { [weak self] state in self?.recordingState = state }
++            .sink { [weak self] state in
++                guard let self else { return }
++                self.recordingState = state
++                switch state {
++                case .starting:
++                    self.lastLiveText = ""
++                    self.menuOpen = false
++                case .recording:
++                    self.menuOpen = false
++                case .idle, .transcribing, .enhancing, .busy:
++                    break
++                }
++            }
+             .store(in: &cancellables)
+ 
+         engine.$partialTranscript
+             .removeDuplicates()
+-            .sink { [weak self] text in self?.partialTranscript = text }
++            .sink { [weak self] text in
++                guard let self else { return }
++                self.partialTranscript = text
++                if !text.isEmpty {
++                    self.lastLiveText = text
++                }
++            }
+             .store(in: &cancellables)
+ 
+         engine.assistantSession.$phase
+@@ -111,6 +168,45 @@ final class NotchIslandModel: ObservableObject {
+             .removeDuplicates()
+             .sink { [weak self] visible in self?.assistantVisible = visible }
+             .store(in: &cancellables)
++
++        NotificationCenter.default.publisher(for: .transcriptionCompleted)
++            .merge(with: NotificationCenter.default.publisher(for: .transcriptionCreated))
++            .receive(on: DispatchQueue.main)
++            .sink { [weak self] _ in
++                guard let self, self.menuOpen else { return }
++                self.reloadLastDictation()
++            }
++            .store(in: &cancellables)
++    }
++
++    // MARK: Menu
++
++    func openMenu() {
++        reloadLastDictation()
++        menuOpen = true
++    }
++
++    func closeMenu() {
++        if menuOpen {
++            menuOpen = false
++        }
++    }
++
++    func reloadLastDictation() {
++        guard let last = LastTranscriptionService.getLastTranscription(from: modelContext) else {
++            lastDictation = nil
++            return
++        }
++        let enhanced = last.enhancedText ?? ""
++        let status = last.transcriptionStatus.flatMap { TranscriptionStatus(rawValue: $0) } ?? .completed
++        let dictation = NotchLastDictation(
++            text: enhanced.isEmpty ? last.text : enhanced,
++            date: last.timestamp,
++            status: status
++        )
++        if dictation != lastDictation {
++            lastDictation = dictation
++        }
+     }
+ 
+     private var showsLiveTranscript: Bool {
+@@ -131,6 +227,7 @@ final class NotchIslandModel: ObservableObject {
+             break
+         }
+ 
++        if menuOpen { return .menu }
+         if isHovering { return .hover }
+         return geometry.hasNotch ? .idle : .hidden
+     }
+@@ -159,17 +256,21 @@ final class NotchIslandModel: ObservableObject {
+             return CGSize(width: width + Self.activeWing * 2, height: row)
+         case .liveText:
+             return CGSize(width: width + Self.liveTextWing * 2, height: row + Self.liveTextPanelHeight)
++        case .menu:
++            return CGSize(width: width + Self.menuWing * 2, height: row + Self.menuPanelHeight)
+         case .assistant:
+             return CGSize(width: width + Self.assistantWing * 2, height: row + Self.assistantPanelHeight)
+         }
+     }
+ 
+-    /// Fixed size of the transparent window that hosts the island in every phase.
++    /// Size of the transparent window that hosts the island outside a dictation (during one it
++    /// covers the whole screen for the edge glow).
+     var windowSize: CGSize {
+-        let largest = size(for: .assistant)
++        let assistant = size(for: .assistant)
++        let menu = size(for: .menu)
+         return CGSize(
+-            width: largest.width + Self.glowPadding * 2,
+-            height: largest.height + Self.glowPadding
++            width: max(assistant.width, menu.width) + Self.glowPadding * 2,
++            height: max(assistant.height, menu.height) + Self.glowPadding
+         )
+     }
+ 
+@@ -238,6 +339,7 @@ final class NotchIslandHostingView<Content: View>: NSHostingView<Content> {
+ final class NotchIslandController {
+     let model: NotchIslandModel
+ 
++    private weak var engine: VoiceInkEngine?
+     private let recorder: Recorder
+     private let assistantSession: AssistantSession
+     private let onTap: () -> Void
+@@ -247,6 +349,7 @@ final class NotchIslandController {
+     private var panel: NotchIslandPanel?
+     private var eventMonitors: [Any] = []
+     private var hoverExitTask: Task<Void, Never>?
++    private var menuCloseTask: Task<Void, Never>?
+     private var repositionTask: Task<Void, Never>?
+     private var cancellables = Set<AnyCancellable>()
+     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "NotchIsland")
+@@ -260,6 +363,7 @@ final class NotchIslandController {
+     ) {
+         let screen = NotchIslandController.idleScreen()
+         self.model = NotchIslandModel(engine: engine, geometry: screen.map { NotchGeometry.make(for: $0) } ?? .fallback)
++        self.engine = engine
+         self.recorder = recorder
+         self.assistantSession = engine.assistantSession
+         self.onTap = onTap
+@@ -308,23 +412,23 @@ final class NotchIslandController {
+             model.targetAppIcon = nil
+         }
+ 
++        model.closeMenu()
++        model.sessionActive = true
+         place(on: screen)
+         installEventMonitors()
+-        model.sessionActive = true
+         return true
+     }
+ 
+-    /// The dictation ended: collapse, then return to the notch display if it moved.
++    /// The dictation ended: collapse, then shrink the window again (and return to the notch
++    /// display if it moved).
+     func endSession() {
+         model.sessionActive = false
+         repositionTask?.cancel()
+         repositionTask = Task { @MainActor [weak self] in
+-            // Let the collapse animation finish before the window jumps screens.
+-            try? await Task.sleep(nanoseconds: 600_000_000)
++            // Let the collapse and glow fade-out finish before the window changes.
++            try? await Task.sleep(nanoseconds: 700_000_000)
+             guard let self, !Task.isCancelled, !self.model.sessionActive else { return }
+-            if let screen = NotchIslandController.idleScreen(),
+-                NotchGeometry.make(for: screen) != self.model.geometry
+-            {
++            if let screen = NotchIslandController.idleScreen() {
+                 self.place(on: screen)
+             }
+         }
+@@ -339,10 +443,23 @@ final class NotchIslandController {
+     func destroy() {
+         repositionTask?.cancel()
+         hoverExitTask?.cancel()
++        menuCloseTask?.cancel()
+         removeEventMonitors()
+         destroyPanel()
+     }
+ 
++    /// Transcribes the audio of the last dictation again (result goes to the clipboard).
++    private func retryLastDictation() {
++        guard let engine else { return }
++        model.closeMenu()
++        LastTranscriptionService.retryLastTranscription(
++            from: engine.modelContext,
++            transcriptionModelManager: engine.transcriptionModelManager,
++            serviceRegistry: engine.serviceRegistry,
++            enhancementService: engine.enhancementService
++        )
++    }
++
+     // MARK: Window
+ 
+     private func ensurePanel() {
+@@ -355,7 +472,8 @@ final class NotchIslandController {
+             assistantSession: assistantSession,
+             onTap: onTap,
+             onClose: onClose,
+-            onAssistantFollowUp: onAssistantFollowUp
++            onAssistantFollowUp: onAssistantFollowUp,
++            onRetryLast: { [weak self] in self?.retryLastDictation() }
+         )
+         let hosting = NotchIslandHostingView(rootView: view)
+         hosting.sizingOptions = []
+@@ -378,14 +496,23 @@ final class NotchIslandController {
+         }
+ 
+         guard let panel else { return }
+-        let size = model.windowSize
+-        let frame = NSRect(
+-            x: screen.frame.midX - size.width / 2,
+-            y: screen.frame.maxY - size.height,
+-            width: size.width,
+-            height: size.height
+-        )
+-        panel.setFrame(frame, display: true)
++        let frame: NSRect
++        if model.sessionActive && NotchIslandSettings.screenGlowEnabled {
++            // While dictating the window covers the whole screen so its edges can light up.
++            // Clicks still pass through everywhere except on the island (see updatePointerState).
++            frame = screen.frame
++        } else {
++            let size = model.windowSize
++            frame = NSRect(
++                x: screen.frame.midX - size.width / 2,
++                y: screen.frame.maxY - size.height,
++                width: size.width,
++                height: size.height
++            )
++        }
++        if panel.frame != frame {
++            panel.setFrame(frame, display: true)
++        }
+         panel.orderFrontRegardless()
+         updatePointerState()
+     }
+@@ -408,6 +535,20 @@ final class NotchIslandController {
+         }) {
+             eventMonitors.append(local)
+         }
++
++        // A click anywhere else closes the menu.
++        if let clicks = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
++            Task { @MainActor [weak self] in self?.closeMenuIfPointerOutside() }
++        }) {
++            eventMonitors.append(clicks)
++        }
++    }
++
++    private func closeMenuIfPointerOutside() {
++        guard model.menuOpen, !model.hitRect().contains(NSEvent.mouseLocation) else { return }
++        menuCloseTask?.cancel()
++        menuCloseTask = nil
++        model.closeMenu()
+     }
+ 
+     private func removeEventMonitors() {
+@@ -430,10 +571,15 @@ final class NotchIslandController {
+         if inside {
+             hoverExitTask?.cancel()
+             hoverExitTask = nil
++            menuCloseTask?.cancel()
++            menuCloseTask = nil
+             if !model.isHovering {
+                 model.isHovering = true
+             }
+-        } else if model.isHovering, hoverExitTask == nil {
++            return
++        }
++
++        if model.isHovering, hoverExitTask == nil {
+             hoverExitTask = Task { @MainActor [weak self] in
+                 try? await Task.sleep(nanoseconds: 150_000_000)
+                 guard let self, !Task.isCancelled else { return }
+@@ -443,6 +589,18 @@ final class NotchIslandController {
+                 }
+             }
+         }
++
++        // The menu folds away shortly after the pointer leaves it.
++        if model.menuOpen, menuCloseTask == nil {
++            menuCloseTask = Task { @MainActor [weak self] in
++                try? await Task.sleep(nanoseconds: 700_000_000)
++                guard let self, !Task.isCancelled else { return }
++                self.menuCloseTask = nil
++                if !self.model.hitRect().contains(NSEvent.mouseLocation) {
++                    self.model.closeMenu()
++                }
++            }
++        }
+     }
+ 
+     private func modelDidChange() {
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 1c48b26..5ea709e 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -1,7 +1,34 @@
+ import SwiftUI
+ 
++// MARK: - PromoPulse colours
++
++enum NotchIslandStyle {
++    static let gold = hex(0xFDCA3F)
++    static let goldLight = hex(0xFFE08A)
++    static let goldWarm = hex(0xFFD978)
++    static let amber = hex(0xFCA311)
++    static let amberDeep = hex(0xF59E0B)
++    static let navy = hex(0x081021)
++    static let muted = hex(0x98A1B3)
++    static let silver = hex(0xE7E9EE)
++    static let silverDark = hex(0xB5BCC8)
++
++    /// Colours that flow around the screen edge while you speak.
++    static let speakingGradient: [Color] = [goldLight, gold, amber, amberDeep, goldWarm, .white, gold, goldLight]
++    /// Calmer silver shimmer while the text is being processed.
++    static let processingGradient: [Color] = [.white, silver, silverDark, goldLight, silver, .white]
++
++    static func hex(_ value: UInt32) -> Color {
++        Color(
++            red: Double((value >> 16) & 0xFF) / 255,
++            green: Double((value >> 8) & 0xFF) / 255,
++            blue: Double(value & 0xFF) / 255
++        )
++    }
++}
++
+ /// Dynamic-Island style notch: hidden behind the hardware notch while idle, a little larger on
+-/// hover, larger and glowing (Spokenly-style rim light) while dictating.
++/// hover, a menu on click, larger and glowing while dictating.
+ struct NotchIslandView: View {
+     @ObservedObject var model: NotchIslandModel
+     let recorder: Recorder
+@@ -9,39 +36,63 @@ struct NotchIslandView: View {
+     let onTap: () -> Void
+     let onClose: () -> Void
+     let onAssistantFollowUp: (String) -> Void
++    let onRetryLast: () -> Void
+ 
+     @AppStorage(RecorderDisplaySettingsKeys.showLiveTranscript) private var showLiveTranscript = true
++    @AppStorage(NotchIslandSettings.screenGlowKey) private var screenGlowEnabled = true
+ 
+     private let morph = Animation.spring(response: 0.38, dampingFraction: 0.80)
+ 
+     var body: some View {
+         let phase = model.phase
+         let size = model.size(for: phase)
++        let shape = Self.shape(for: phase)
++        let screenGlow = screenGlowEnabled && model.sessionActive && phase.showsScreenGlow
++
++        ZStack(alignment: .top) {
++            if screenGlow {
++                // Sized like the screen and pinned to the top centre, so it lines up with the
++                // island no matter how large the window currently is.
++                NotchScreenGlow(
++                    phase: phase,
++                    islandSize: size,
++                    islandShape: shape,
++                    meter: { recorder.audioMeterSnapshot() }
++                )
++                .frame(width: model.geometry.screenFrame.width, height: model.geometry.screenFrame.height)
++                .transition(.opacity)
++            }
+ 
+-        island(phase: phase, size: size)
+-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+-            .animation(morph, value: phase)
+-            .animation(morph, value: model.geometry)
++            island(phase: phase, size: size, shape: shape, screenGlow: screenGlow)
++        }
++        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
++        .animation(morph, value: phase)
++        .animation(morph, value: model.geometry)
++        .animation(.easeOut(duration: 0.45), value: screenGlow)
+     }
+ 
+     // MARK: - Island
+ 
+-    private func island(phase: NotchIslandPhase, size: CGSize) -> some View {
+-        let shape = Self.shape(for: phase)
+-
+-        return VStack(spacing: 0) {
++    private func island(phase: NotchIslandPhase, size: CGSize, shape: NotchShape, screenGlow: Bool) -> some View {
++        VStack(spacing: 0) {
+             mainRow(phase: phase, size: size, topRadius: shape.topCornerRadius)
+             liveTextPanel(phase: phase)
++            menuPanel(phase: phase)
+             assistantPanel(phase: phase)
+         }
+         .frame(width: size.width, height: size.height, alignment: .top)
+         .background(Color.black)
+         .clipShape(shape)
+         .overlay {
+-            rim(phase: phase, shape: shape)
++            // With the screen glow on, the glow itself draws the outline around the island.
++            if !screenGlow {
++                rim(phase: phase, shape: shape)
++            }
+         }
+         .background {
+-            NotchIslandGlow(phase: phase, shape: shape, meter: { recorder.audioMeterSnapshot() })
++            if !screenGlow {
++                NotchIslandGlow(phase: phase, shape: shape, meter: { recorder.audioMeterSnapshot() })
++            }
+         }
+         .opacity(phase == .hidden ? 0 : 1)
+     }
+@@ -54,7 +105,7 @@ struct NotchIslandView: View {
+             return NotchShape(topCornerRadius: 6, bottomCornerRadius: 12)
+         case .recording, .processing:
+             return NotchShape(topCornerRadius: 8, bottomCornerRadius: 14)
+-        case .liveText, .assistant:
++        case .liveText, .menu, .assistant:
+             return NotchShape(topCornerRadius: 12, bottomCornerRadius: 22)
+         }
+     }
+@@ -63,14 +114,28 @@ struct NotchIslandView: View {
+     private func rim(phase: NotchIslandPhase, shape: NotchShape) -> some View {
+         switch phase {
+         case .recording, .liveText:
+-            shape.stroke(NotchIslandGlow.recordingColor.opacity(0.65), lineWidth: 1)
++            rimLine(shape: shape, color: NotchIslandGlow.recordingColor.opacity(0.75))
+         case .processing:
+-            shape.stroke(NotchIslandGlow.processingColor.opacity(0.5), lineWidth: 1)
+-        default:
++            rimLine(shape: shape, color: NotchIslandGlow.processingColor.opacity(0.55))
++        case .hidden, .idle, .hover, .menu, .assistant:
+             EmptyView()
+         }
+     }
+ 
++    /// Sides and bottom only: a line along the top screen edge would show where the hardware
++    /// notch is, so there is none, and the sides fade out towards the top.
++    private func rimLine(shape: NotchShape, color: Color) -> some View {
++        NotchIslandRimShape(topCornerRadius: shape.topCornerRadius, bottomCornerRadius: shape.bottomCornerRadius)
++            .stroke(color, style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
++            .mask {
++                LinearGradient(
++                    colors: [.clear, .white],
++                    startPoint: .top,
++                    endPoint: UnitPoint(x: 0.5, y: 0.6)
++                )
++            }
++    }
++
+     // MARK: - Main row (the part beside the hardware notch)
+ 
+     private func mainRow(phase: NotchIslandPhase, size: CGSize, topRadius: CGFloat) -> some View {
+@@ -91,7 +156,11 @@ struct NotchIslandView: View {
+         .contentShape(Rectangle())
+         .onTapGesture {
+             switch phase {
+-            case .hidden, .idle, .hover, .recording, .liveText:
++            case .hidden, .idle, .hover:
++                model.openMenu()
++            case .menu:
++                model.closeMenu()
++            case .recording, .liveText:
+                 onTap()
+             case .processing, .assistant:
+                 break
+@@ -107,6 +176,24 @@ struct NotchIslandView: View {
+                 Image(systemName: "mic.fill")
+                     .font(.system(size: 11, weight: .semibold))
+                     .foregroundStyle(Color.white.opacity(0.9))
++            case .menu:
++                Button(action: onTap) {
++                    HStack(spacing: 5) {
++                        Image(systemName: "mic.fill")
++                            .font(.system(size: 9.5, weight: .bold))
++                        Text("Dictate", tableName: "NotchIsland")
++                            .font(.system(size: 11, weight: .semibold))
++                            .lineLimit(1)
++                    }
++                    .foregroundStyle(NotchIslandStyle.navy)
++                    .padding(.horizontal, 10)
++                    .frame(height: 21)
++                    .background(Capsule().fill(NotchIslandStyle.gold))
++                    .contentShape(Capsule())
++                }
++                .buttonStyle(.plain)
++                .frame(maxWidth: .infinity, alignment: .leading)
++                .padding(.leading, 8)
+             case .recording, .liveText, .processing:
+                 targetAppBadge(phase: phase)
+             case .assistant:
+@@ -145,6 +232,10 @@ struct NotchIslandView: View {
+                 Image(systemName: "waveform")
+                     .font(.system(size: 10, weight: .semibold))
+                     .foregroundStyle(Color.white.opacity(0.55))
++            case .menu:
++                RecorderCloseButton(action: { model.closeMenu() })
++                    .frame(maxWidth: .infinity, alignment: .trailing)
++                    .padding(.trailing, 8)
+             case .recording, .liveText:
+                 NotchIslandWaveform(
+                     meter: { recorder.audioMeterSnapshot() },
+@@ -183,6 +274,16 @@ struct NotchIslandView: View {
+         }
+     }
+ 
++    @ViewBuilder
++    private func menuPanel(phase: NotchIslandPhase) -> some View {
++        if phase == .menu {
++            NotchIslandMenuPanel(model: model, onRetry: onRetryLast)
++                .frame(height: NotchIslandModel.menuPanelHeight)
++                .clipped()
++                .transition(.opacity)
++        }
++    }
++
+     @ViewBuilder
+     private func assistantPanel(phase: NotchIslandPhase) -> some View {
+         if phase == .assistant {
+@@ -202,11 +303,406 @@ struct NotchIslandView: View {
+     }
+ }
+ 
+-// MARK: - Glow
++// MARK: - Menu (click on the notch)
++
++struct NotchLanguageOption: Identifiable {
++    let code: String
++    let label: String
++    var id: String { code }
++
++    static let all: [NotchLanguageOption] = [
++        NotchLanguageOption(code: "de", label: "DE"),
++        NotchLanguageOption(code: "en", label: "EN"),
++        NotchLanguageOption(code: "fr", label: "FR"),
++        NotchLanguageOption(code: "es", label: "ES"),
++    ]
++}
++
++/// Language switch and the last dictation, so text that went nowhere (no text field, an error)
++/// can always be copied again.
++struct NotchIslandMenuPanel: View {
++    @ObservedObject var model: NotchIslandModel
++    let onRetry: () -> Void
++
++    @AppStorage("SelectedLanguage") private var selectedLanguage = "en"
++    @State private var copied = false
++
++    private struct Content {
++        var title: Text
++        var text: String
++        var isPlaceholder = false
++        var canCopy = true
++        var canRetry = false
++    }
++
++    var body: some View {
++        let content = makeContent()
++
++        VStack(alignment: .leading, spacing: 0) {
++            Rectangle()
++                .fill(Color.white.opacity(0.12))
++                .frame(height: 1)
++
++            HStack(spacing: 6) {
++                sectionLabel(Text("Language", tableName: "NotchIsland"))
++                Spacer(minLength: 8)
++                ForEach(NotchLanguageOption.all) { option in
++                    languageChip(option)
++                }
++            }
++            .padding(.top, 10)
++
++            HStack(spacing: 8) {
++                sectionLabel(content.title)
++                    .lineLimit(1)
++                Spacer(minLength: 8)
++                if content.canRetry {
++                    retryButton
++                }
++                if content.canCopy {
++                    copyButton(text: content.text)
++                }
++            }
++            .frame(height: 22)
++            .padding(.top, 12)
++
++            ScrollView(.vertical, showsIndicators: false) {
++                Text(content.text)
++                    .font(.system(size: 12.5))
++                    .foregroundStyle(Color.white.opacity(content.isPlaceholder ? 0.45 : 0.92))
++                    .lineSpacing(2)
++                    .frame(maxWidth: .infinity, alignment: .leading)
++                    .textSelection(.enabled)
++            }
++            .padding(.top, 6)
++        }
++        .padding(.horizontal, 22)
++        .padding(.bottom, 12)
++    }
++
++    private func makeContent() -> Content {
++        let live = model.lastLiveText
++        let lastTitle = Text("Last Dictation", tableName: "NotchIsland")
++
++        guard let last = model.lastDictation else {
++            if !live.isEmpty {
++                return Content(title: Text("Live Text", tableName: "NotchIsland"), text: live)
++            }
++            return Content(
++                title: lastTitle,
++                text: String(localized: "Nothing dictated yet.", table: "NotchIsland"),
++                isPlaceholder: true,
++                canCopy: false
++            )
++        }
++
++        let when = Text(verbatim: " · " + Self.relativeTime(last.date))
++
++        switch last.status {
++        case .completed:
++            return Content(title: lastTitle + when, text: last.text)
++        case .failed:
++            if !live.isEmpty {
++                return Content(title: Text("Failed - Live Text", tableName: "NotchIsland"), text: live, canRetry: true)
++            }
++            return Content(
++                title: Text("Transcription Failed", tableName: "NotchIsland") + when,
++                text: last.text,
++                isPlaceholder: true,
++                canCopy: false,
++                canRetry: true
++            )
++        case .canceled:
++            if !live.isEmpty {
++                return Content(title: Text("Canceled - Live Text", tableName: "NotchIsland"), text: live, canRetry: true)
++            }
++            return Content(
++                title: Text("Canceled", tableName: "NotchIsland") + when,
++                text: String(localized: "The dictation was canceled. You can transcribe it again.", table: "NotchIsland"),
++                isPlaceholder: true,
++                canCopy: false,
++                canRetry: true
++            )
++        case .pending:
++            if !live.isEmpty {
++                return Content(title: Text("Live Text", tableName: "NotchIsland"), text: live)
++            }
++            return Content(
++                title: lastTitle + when,
++                text: String(localized: "Still being processed…", table: "NotchIsland"),
++                isPlaceholder: true,
++                canCopy: false
++            )
++        }
++    }
++
++    private static func relativeTime(_ date: Date) -> String {
++        let formatter = RelativeDateTimeFormatter()
++        formatter.unitsStyle = .short
++        return formatter.localizedString(for: date, relativeTo: Date())
++    }
++
++    private func sectionLabel(_ text: Text) -> some View {
++        text
++            .font(.system(size: 9, weight: .semibold))
++            .tracking(1.6)
++            .textCase(.uppercase)
++            .foregroundStyle(NotchIslandStyle.muted)
++    }
++
++    private func languageChip(_ option: NotchLanguageOption) -> some View {
++        let selected = selectedLanguage == option.code
++        return Button {
++            select(option.code)
++        } label: {
++            Text(verbatim: option.label)
++                .font(.system(size: 10.5, weight: .bold))
++                .tracking(0.6)
++                .foregroundStyle(selected ? NotchIslandStyle.navy : Color.white.opacity(0.78))
++                .frame(width: 34, height: 22)
++                .background(
++                    RoundedRectangle(cornerRadius: 7, style: .continuous)
++                        .fill(selected ? NotchIslandStyle.gold : Color.white.opacity(0.07))
++                )
++                .overlay(
++                    RoundedRectangle(cornerRadius: 7, style: .continuous)
++                        .strokeBorder(Color.white.opacity(selected ? 0 : 0.14), lineWidth: 0.6)
++                )
++                .contentShape(Rectangle())
++        }
++        .buttonStyle(.plain)
++    }
++
++    private func select(_ code: String) {
++        guard selectedLanguage != code else { return }
++        selectedLanguage = code
++        // Same notifications as the language picker in the settings (updates the Whisper prompt).
++        NotificationCenter.default.post(name: .languageDidChange, object: nil)
++        NotificationCenter.default.post(name: .AppSettingsDidChange, object: nil)
++    }
++
++    private func copyButton(text: String) -> some View {
++        Button {
++            guard ClipboardManager.copyToClipboard(text) else { return }
++            copied = true
++            Task { @MainActor in
++                try? await Task.sleep(nanoseconds: 1_600_000_000)
++                copied = false
++            }
++        } label: {
++            HStack(spacing: 4) {
++                Image(systemName: copied ? "checkmark" : "doc.on.doc")
++                    .font(.system(size: 9.5, weight: .bold))
++                if copied {
++                    Text("Copied", tableName: "NotchIsland")
++                        .font(.system(size: 11, weight: .semibold))
++                } else {
++                    Text("Copy", tableName: "NotchIsland")
++                        .font(.system(size: 11, weight: .semibold))
++                }
++            }
++            .foregroundStyle(NotchIslandStyle.navy)
++            .padding(.horizontal, 10)
++            .frame(height: 22)
++            .background(Capsule().fill(NotchIslandStyle.gold))
++            .contentShape(Capsule())
++        }
++        .buttonStyle(.plain)
++    }
++
++    private var retryButton: some View {
++        Button(action: onRetry) {
++            HStack(spacing: 4) {
++                Image(systemName: "arrow.clockwise")
++                    .font(.system(size: 9.5, weight: .bold))
++                Text("Retry", tableName: "NotchIsland")
++                    .font(.system(size: 11, weight: .semibold))
++            }
++            .foregroundStyle(Color.white.opacity(0.85))
++            .padding(.horizontal, 10)
++            .frame(height: 22)
++            .background(Capsule().fill(Color.white.opacity(0.1)))
++            .contentShape(Capsule())
++        }
++        .buttonStyle(.plain)
++    }
++}
++
++// MARK: - Island outline without the top edge
++
++struct NotchIslandRimShape: Shape {
++    var topCornerRadius: CGFloat
++    var bottomCornerRadius: CGFloat
++
++    var animatableData: AnimatablePair<CGFloat, CGFloat> {
++        get { AnimatablePair(topCornerRadius, bottomCornerRadius) }
++        set {
++            topCornerRadius = newValue.first
++            bottomCornerRadius = newValue.second
++        }
++    }
++
++    func path(in rect: CGRect) -> Path {
++        let top = topCornerRadius
++        let bottom = bottomCornerRadius
++        var path = Path()
++        path.move(to: CGPoint(x: rect.minX + top, y: rect.minY + top))
++        path.addLine(to: CGPoint(x: rect.minX + top, y: rect.maxY - bottom))
++        path.addQuadCurve(
++            to: CGPoint(x: rect.minX + top + bottom, y: rect.maxY),
++            control: CGPoint(x: rect.minX + top, y: rect.maxY)
++        )
++        path.addLine(to: CGPoint(x: rect.maxX - top - bottom, y: rect.maxY))
++        path.addQuadCurve(
++            to: CGPoint(x: rect.maxX - top, y: rect.maxY - bottom),
++            control: CGPoint(x: rect.maxX - top, y: rect.maxY)
++        )
++        path.addLine(to: CGPoint(x: rect.maxX - top, y: rect.minY + top))
++        return path
++    }
++}
++
++// MARK: - Screen edge glow (Siri style)
++
++/// One closed line along every screen edge that dips around the island, so the island's outline
++/// and the screen glow are the same light. Assumes the view is exactly as large as the screen.
++struct NotchScreenGlowShape: Shape {
++    var islandWidth: CGFloat
++    var islandHeight: CGFloat
++    var topCornerRadius: CGFloat
++    var bottomCornerRadius: CGFloat
++    var screenCornerRadius: CGFloat = 10
++
++    var animatableData: AnimatablePair<AnimatablePair<CGFloat, CGFloat>, AnimatablePair<CGFloat, CGFloat>> {
++        get {
++            AnimatablePair(
++                AnimatablePair(islandWidth, islandHeight),
++                AnimatablePair(topCornerRadius, bottomCornerRadius)
++            )
++        }
++        set {
++            islandWidth = newValue.first.first
++            islandHeight = newValue.first.second
++            topCornerRadius = newValue.second.first
++            bottomCornerRadius = newValue.second.second
++        }
++    }
++
++    func path(in rect: CGRect) -> Path {
++        let corner = min(screenCornerRadius, rect.width / 4, rect.height / 4)
++        let width = min(max(islandWidth, 0), max(0, rect.width - corner * 2))
++        let height = min(max(islandHeight, 0), rect.height / 2)
++        let top = min(topCornerRadius, width / 4)
++        let bottom = min(bottomCornerRadius, max(0, height - top), max(0, width / 2 - top))
++        let left = rect.midX - width / 2
++        let right = rect.midX + width / 2
++        let minY = rect.minY
++
++        var path = Path()
++        // Top edge right of the island, then clockwise around the screen.
++        path.move(to: CGPoint(x: right, y: minY))
++        path.addLine(to: CGPoint(x: rect.maxX - corner, y: minY))
++        path.addQuadCurve(to: CGPoint(x: rect.maxX, y: minY + corner), control: CGPoint(x: rect.maxX, y: minY))
++        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - corner))
++        path.addQuadCurve(to: CGPoint(x: rect.maxX - corner, y: rect.maxY), control: CGPoint(x: rect.maxX, y: rect.maxY))
++        path.addLine(to: CGPoint(x: rect.minX + corner, y: rect.maxY))
++        path.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.maxY - corner), control: CGPoint(x: rect.minX, y: rect.maxY))
++        path.addLine(to: CGPoint(x: rect.minX, y: minY + corner))
++        path.addQuadCurve(to: CGPoint(x: rect.minX + corner, y: minY), control: CGPoint(x: rect.minX, y: minY))
++        path.addLine(to: CGPoint(x: left, y: minY))
++        // Down and around the island (same outline as NotchShape).
++        path.addQuadCurve(to: CGPoint(x: left + top, y: minY + top), control: CGPoint(x: left + top, y: minY))
++        path.addLine(to: CGPoint(x: left + top, y: minY + height - bottom))
++        path.addQuadCurve(
++            to: CGPoint(x: left + top + bottom, y: minY + height),
++            control: CGPoint(x: left + top, y: minY + height)
++        )
++        path.addLine(to: CGPoint(x: right - top - bottom, y: minY + height))
++        path.addQuadCurve(
++            to: CGPoint(x: right - top, y: minY + height - bottom),
++            control: CGPoint(x: right - top, y: minY + height)
++        )
++        path.addLine(to: CGPoint(x: right - top, y: minY + top))
++        path.addQuadCurve(to: CGPoint(x: right, y: minY), control: CGPoint(x: right - top, y: minY))
++        path.closeSubpath()
++        return path
++    }
++}
++
++/// Smooths the microphone level and turns the colours around the screen at a speed that
++/// follows the voice.
++final class NotchGlowAnimator {
++    private var level: Double = 0
++    private var angle: Double = 0
++    private var lastTime: TimeInterval?
++
++    func step(time: TimeInterval, targetLevel: Double, speaking: Bool) -> (level: Double, angle: Double) {
++        let delta = lastTime.map { min(max(time - $0, 0), 0.1) } ?? 0
++        lastTime = time
++        let rate = targetLevel > level ? 0.45 : 0.12
++        level += (targetLevel - level) * rate
++        let degreesPerSecond = speaking ? 40 + 120 * level : 22
++        angle = (angle + degreesPerSecond * delta).truncatingRemainder(dividingBy: 360)
++        return (level, angle)
++    }
++}
++
++/// Light around the whole screen while dictating: flowing PromoPulse gold that swells with your
++/// voice, then a calm silver pulse while the text is processed.
++struct NotchScreenGlow: View {
++    let phase: NotchIslandPhase
++    let islandSize: CGSize
++    let islandShape: NotchShape
++    let meter: () -> AudioMeter
++
++    @State private var animator = NotchGlowAnimator()
++
++    var body: some View {
++        let outline = NotchScreenGlowShape(
++            islandWidth: islandSize.width,
++            islandHeight: islandSize.height,
++            topCornerRadius: islandShape.topCornerRadius,
++            bottomCornerRadius: islandShape.bottomCornerRadius
++        )
++        let speaking = phase == .recording || phase == .liveText
++
++        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
++            let time = context.date.timeIntervalSinceReferenceDate
++            let target = speaking ? max(0, min(1, pow(meter().averagePower, 0.7))) : 0
++            let step = animator.step(time: time, targetLevel: target, speaking: speaking)
++            let level = CGFloat(step.level)
++            let pulse = CGFloat((sin(time * 2.4) + 1) / 2)
++
++            let gradient = AngularGradient(
++                gradient: Gradient(colors: speaking ? NotchIslandStyle.speakingGradient : NotchIslandStyle.processingGradient),
++                center: .center,
++                angle: .degrees(step.angle)
++            )
++            let haloWidth: CGFloat = speaking ? 18 + 36 * level : 12 + 8 * pulse
++            let haloOpacity: Double = speaking ? 0.55 + 0.4 * Double(level) : 0.3 + 0.25 * Double(pulse)
++            let coreWidth: CGFloat = speaking ? 3 + 3 * level : 2
++            let coreOpacity: Double = speaking ? 0.85 : 0.45 + 0.3 * Double(pulse)
++
++            ZStack {
++                outline
++                    .stroke(gradient, lineWidth: haloWidth)
++                    .blur(radius: haloWidth * 0.6)
++                    .opacity(haloOpacity)
++                outline
++                    .stroke(gradient, lineWidth: coreWidth)
++                    .blur(radius: 1.5)
++                    .opacity(coreOpacity)
++            }
++        }
++        .allowsHitTesting(false)
++    }
++}
++
++// MARK: - Island glow (used when the screen glow is off)
+ 
+ struct NotchIslandGlow: View {
+-    static let recordingColor = Color(red: 1.0, green: 0.30, blue: 0.36)
+-    static let processingColor = Color(red: 0.62, green: 0.46, blue: 1.0)
++    static let recordingColor = NotchIslandStyle.gold
++    static let processingColor = NotchIslandStyle.silver
+ 
+     let phase: NotchIslandPhase
+     let shape: NotchShape
+@@ -227,6 +723,8 @@ struct NotchIslandGlow: View {
+             }
+         case .hover:
+             glow(color: .white, strength: 0.16, radius: 8)
++        case .menu:
++            glow(color: .white, strength: 0.12, radius: 10)
+         case .hidden, .idle, .assistant:
+             Color.clear
+         }
+@@ -259,7 +757,7 @@ struct NotchIslandWaveform: View {
+             HStack(spacing: 2.5) {
+                 ForEach(0..<barCount, id: \.self) { index in
+                     Capsule()
+-                        .fill(Color.white.opacity(0.92))
++                        .fill(NotchIslandStyle.gold)
+                         .frame(width: barWidth, height: barHeight(index: index, level: level, time: time))
+                 }
+             }
+diff --git a/VoiceInk/Features/Settings/Views/SettingsView.swift b/VoiceInk/Features/Settings/Views/SettingsView.swift
+index 4928b11..1a0846f 100644
+--- a/VoiceInk/Features/Settings/Views/SettingsView.swift
++++ b/VoiceInk/Features/Settings/Views/SettingsView.swift
+@@ -26,6 +26,7 @@ struct SettingsView: View {
+         .systemValue
+     @AppStorage(RecorderDisplaySettingsKeys.showLiveTranscript) private var showLiveTranscript = true
+     @AppStorage(FourFingerTapMonitor.enabledKey) private var fourFingerTapEnabled = true
++    @AppStorage(NotchIslandSettings.screenGlowKey) private var screenGlowEnabled = true
+     @AppStorage(FinishAndSendSettings.key) private var finishAndSendKey = FinishAndSendKey.none.rawValue
+     @State private var showResetOnboardingAlert = false
+     @State private var showLanguageRestartAlert = false
+@@ -251,6 +252,18 @@ struct SettingsView: View {
+                 .onChange(of: fourFingerTapEnabled) { _, newValue in
+                     FourFingerTapMonitor.shared.setEnabled(newValue)
+                 }
++
++                Toggle(isOn: $screenGlowEnabled) {
++                    HStack(spacing: 4) {
++                        Text("Screen Glow While Dictating", tableName: "NotchIsland")
++                        InfoTip(
++                            String(
++                                localized: "The edges of the screen light up in gold while you dictate and react to your voice.",
++                                table: "NotchIsland"
++                            )
++                        )
++                    }
++                }
+             }
+ 
+             Section("General") {
+diff --git a/VoiceInk/NotchIsland.xcstrings b/VoiceInk/NotchIsland.xcstrings
+index d9e35d0..3800fc3 100644
+--- a/VoiceInk/NotchIsland.xcstrings
++++ b/VoiceInk/NotchIsland.xcstrings
+@@ -1,6 +1,102 @@
+ {
+   "sourceLanguage" : "en",
+   "strings" : {
++    "Canceled" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Abgebrochen"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Annulée"
++          }
++        }
++      }
++    },
++    "Canceled - Live Text" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Abgebrochen · Live-Text"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Annulée · texte en direct"
++          }
++        }
++      }
++    },
++    "Copied" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Kopiert"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Copié"
++          }
++        }
++      }
++    },
++    "Copy" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Kopieren"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Copier"
++          }
++        }
++      }
++    },
++    "Dictate" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Diktieren"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Dicter"
++          }
++        }
++      }
++    },
++    "Failed - Live Text" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Fehlgeschlagen · Live-Text"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Échec · texte en direct"
++          }
++        }
++      }
++    },
+     "Four-Finger Tap to Dictate" : {
+       "localizations" : {
+         "de" : {
+@@ -17,6 +113,118 @@
+         }
+       }
+     },
++    "Language" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Sprache"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Langue"
++          }
++        }
++      }
++    },
++    "Last Dictation" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Letztes Diktat"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Dernière dictée"
++          }
++        }
++      }
++    },
++    "Live Text" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Live-Text"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Texte en direct"
++          }
++        }
++      }
++    },
++    "Nothing dictated yet." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Noch nichts diktiert."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Rien n’a encore été dicté."
++          }
++        }
++      }
++    },
++    "Retry" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Erneut"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Réessayer"
++          }
++        }
++      }
++    },
++    "Screen Glow While Dictating" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Bildschirmrand leuchtet beim Diktieren"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Bords de l’écran lumineux pendant la dictée"
++          }
++        }
++      }
++    },
++    "Still being processed…" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Wird noch verarbeitet …"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Traitement en cours…"
++          }
++        }
++      }
++    },
+     "Tap the trackpad with four fingers to start dictating. Tap again to stop and insert the text." : {
+       "localizations" : {
+         "de" : {
+@@ -32,6 +240,54 @@
+           }
+         }
+       }
++    },
++    "The dictation was canceled. You can transcribe it again." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Das Diktat wurde abgebrochen. Du kannst es erneut transkribieren."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "La dictée a été annulée. Vous pouvez la transcrire à nouveau."
++          }
++        }
++      }
++    },
++    "The edges of the screen light up in gold while you dictate and react to your voice." : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Beim Diktieren leuchten die Ränder des Bildschirms in Gold und reagieren auf deine Stimme."
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Les bords de l’écran s’illuminent en or pendant la dictée et réagissent à votre voix."
++          }
++        }
++      }
++    },
++    "Transcription Failed" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Transkription fehlgeschlagen"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Échec de la transcription"
++          }
++        }
++      }
+     }
+   },
+   "version" : "1.0"
