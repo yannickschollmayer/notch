@@ -1,0 +1,257 @@
+diff --git a/VoiceInk/Core/Enhancement/AIPrompts.swift b/VoiceInk/Core/Enhancement/AIPrompts.swift
+index d0c8991..eb765e7 100644
+--- a/VoiceInk/Core/Enhancement/AIPrompts.swift
++++ b/VoiceInk/Core/Enhancement/AIPrompts.swift
+@@ -9,3 +9,3 @@ enum AIPrompts {
+         <RULES>
+-        - Use the same language as <TRANSCRIPT>.
++        - Use the same language as <TRANSCRIPT>. When the speaker mixes languages (for example German and English while practising English), keep every part in the language it was spoken in; never translate.
+         - Preserve the speaker’s meaning, wording, tone, certainty, emotion, and level of formality. Do not paraphrase, summarize, formalize, soften, strengthen, or change what the speaker intended.
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index f2231ed..441b2f3 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -185,2 +185,5 @@ final class NotchIslandModel: ObservableObject {
+     static let rowBonus: CGFloat = 5
++    /// Coming this close beside and below the notch already counts as being on it.
++    static let nearMargin: CGFloat = 20
++    static let nearDepth: CGFloat = 26
+     static let liveTextPanelHeight: CGFloat = 57
+@@ -468,2 +471,17 @@ final class NotchIslandModel: ObservableObject {
+ 
++    /// Close beside and below the notch: enough to wake it, so you never have to touch the top
++    /// edge of the screen (where macOS brings in the menu bar). Only for hovering; clicks there
++    /// still go to the app below.
++    func isNear(_ point: NSPoint) -> Bool {
++        let frame = geometry.screenFrame
++        let width = geometry.notchWidth + (Self.hoverWing + Self.nearMargin) * 2
++        let height = geometry.notchHeight + Self.rowBonus + Self.nearDepth
++        return NSRect(x: frame.midX - width / 2, y: frame.maxY - height, width: width, height: height).contains(point)
++    }
++
++    /// On the island, or close enough to count as hovering it.
++    func senses(_ point: NSPoint) -> Bool {
++        containsPointer(point) || isNear(point)
++    }
++
+     /// Whether the pointer counts as "on the island": the island, its card, and the gap between.
+@@ -938,6 +956,9 @@ final class NotchIslandController {
+         guard let panel else { return }
+-        let inside = model.containsPointer(NSEvent.mouseLocation)
++        let location = NSEvent.mouseLocation
++        // Only the island itself takes clicks; coming close is enough to wake it.
++        let onIsland = model.containsPointer(location)
++        let inside = onIsland || model.isNear(location)
+ 
+-        if panel.ignoresMouseEvents == inside {
+-            panel.ignoresMouseEvents = !inside
++        if panel.ignoresMouseEvents == onIsland {
++            panel.ignoresMouseEvents = !onIsland
+         }
+@@ -967,3 +988,3 @@ final class NotchIslandController {
+                 self.hoverExitTask = nil
+-                if !self.model.containsPointer(NSEvent.mouseLocation) {
++                if !self.model.senses(NSEvent.mouseLocation) {
+                     self.model.isHovering = false
+@@ -979,3 +1000,3 @@ final class NotchIslandController {
+                 self.menuCloseTask = nil
+-                if !self.model.containsPointer(NSEvent.mouseLocation) {
++                if !self.model.senses(NSEvent.mouseLocation) {
+                     self.model.closeMenu()
+@@ -993,3 +1014,3 @@ final class NotchIslandController {
+             self.hoverOpenTask = nil
+-            if self.model.canOpenOnHover, self.model.containsPointer(NSEvent.mouseLocation) {
++            if self.model.canOpenOnHover, self.model.senses(NSEvent.mouseLocation) {
+                 self.model.openMenu()
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index 9e5fa3e..a809539 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -27,3 +27,4 @@ final class NotchScreenGlowWindow {
+         case processing
+-        /// A file is being dragged: only the top around the island lights up, breathing gently.
++        /// A file is being dragged: only the top around the island lights up, fine, soft and
++        /// breathing gently.
+         case invite
+@@ -570,6 +571,5 @@ enum NotchGlowShader {
+             // The voice makes all three bigger.
+-            // Waiting for a dropped file: a gentle breath instead of the voice.
+-            float breath = u.focus * (0.12f + 0.12f * sin(u.time * 6.2831853f / 2.2f));
+-            float level = clamp(max(u.level, breath), 0.0f, 1.0f);
+-            float lineWidth = mix(2.4f, 7.0f, level);
++            float level = clamp(u.level, 0.0f, 1.0f);
++            // Waiting for a dropped file: a finer line.
++            float lineWidth = mix(mix(2.4f, 7.0f, level), 1.5f, u.focus);
+             float core = 1.0f - smoothstep(lineWidth, lineWidth + mix(1.0f, 2.0f, level), e);
+@@ -577,2 +577,4 @@ enum NotchGlowShader {
+             float shimmer = mix(0.26f, 0.38f, level) * exp(-pow(glowDistance / mix(16.0f, 28.0f, level), 1.5f));
++            bloom *= mix(1.0f, 0.6f, u.focus);
++            shimmer *= mix(1.0f, 0.65f, u.focus);
+ 
+@@ -581,2 +583,5 @@ enum NotchGlowShader {
+             strength *= clamp(u.opacity, 0.0f, 1.0f) * coverage;
++            // Waiting for a dropped file: quieter, breathing gently.
++            float breath = 0.5f + 0.5f * sin(u.time * 6.2831853f / 2.2f);
++            strength *= mix(1.0f, 0.7f + 0.2f * breath, clamp(u.focus, 0.0f, 1.0f));
+             // Waiting for a dropped file: only the top around the island, fading out along the edge.
+@@ -598,2 +603,6 @@ enum NotchGlowShader {
+             hazeColor = mix(hazeColor, silver, u.processing);
++            // Waiting for a dropped file: softer colours.
++            float3 luma = float3(0.299f, 0.587f, 0.114f);
++            lineColor = mix(lineColor, float3(dot(lineColor, luma)), 0.3f * u.focus);
++            hazeColor = mix(hazeColor, float3(dot(hazeColor, luma)), 0.3f * u.focus);
+ 
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index c77cb28..ad3f012 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -28,2 +28,15 @@ enum NotchIslandStyle {
+ extension View {
++    /// Liquid Glass capsule for buttons in the island (macOS 26 and later), frosted before.
++    @ViewBuilder
++    func notchGlassCapsule(tint: Color? = nil) -> some View {
++        if #available(macOS 26.0, *) {
++            self.glassEffect(tint.map { Glass.regular.tint($0) } ?? .regular, in: Capsule())
++        } else {
++            self
++                .background(.ultraThinMaterial, in: Capsule())
++                .background(Capsule().fill(tint ?? Color.clear))
++                .overlay(Capsule().strokeBorder(Color.white.opacity(0.14), lineWidth: 0.6))
++        }
++    }
++
+     /// Liquid Glass on macOS 26 and later, frosted material before.
+@@ -155,4 +168,7 @@ struct NotchIslandView: View {
+         }
+-        .compositingGroup()
+-        .shadow(color: Color.black.opacity(shadowed ? 0.55 : 0), radius: 14, x: 0, y: 5)
++        .background {
++            shape
++                .fill(Color.black)
++                .shadow(color: Color.black.opacity(shadowed ? 0.55 : 0), radius: 14, x: 0, y: 5)
++        }
+         .scaleEffect(pressScale, anchor: .top)
+@@ -498,2 +514,4 @@ struct NotchLanguageOption: Identifiable {
+ 
++    var width: CGFloat { label.count > 2 ? 46 : 33 }
++
+     static let all: [NotchLanguageOption] = [
+@@ -501,2 +519,5 @@ struct NotchLanguageOption: Identifiable {
+         NotchLanguageOption(code: "en", label: "EN"),
++        // German and English mixed (e.g. practising English): the language is recognised as you
++        // speak, and the AI keeps every part in the language it was said in.
++        NotchLanguageOption(code: "auto", label: "DE/EN"),
+         NotchLanguageOption(code: "fr", label: "FR"),
+@@ -534,2 +555,3 @@ struct NotchDictationSection: View {
+     @State private var copied = false
++    @Namespace private var languageSelection
+ 
+@@ -548,5 +570,3 @@ struct NotchDictationSection: View {
+             HStack(spacing: 6) {
+-                ForEach(NotchLanguageOption.all) { option in
+-                    languageChip(option)
+-                }
++                languagePicker
+                 Spacer(minLength: 8)
+@@ -652,2 +672,14 @@ struct NotchDictationSection: View {
+ 
++    /// Like Apple's segmented controls: a quiet track, the chosen language on a glass capsule
++    /// that slides over.
++    private var languagePicker: some View {
++        HStack(spacing: 0) {
++            ForEach(NotchLanguageOption.all) { option in
++                languageChip(option)
++            }
++        }
++        .padding(2)
++        .background(Capsule().fill(Color.white.opacity(0.07)))
++    }
++
+     private func languageChip(_ option: NotchLanguageOption) -> some View {
+@@ -655,12 +687,18 @@ struct NotchDictationSection: View {
+         return Button {
+-            select(option.code)
++            withAnimation(.spring(response: 0.32, dampingFraction: 0.8)) {
++                select(option.code)
++            }
+         } label: {
+             Text(verbatim: option.label)
+-                .font(.system(size: 10.5, weight: .bold))
+-                .tracking(0.6)
+-                .foregroundStyle(selected ? NotchIslandStyle.navy : Color.white.opacity(0.85))
+-                .frame(width: 36, height: 26)
+-                .background(
+-                    Capsule().fill(selected ? NotchIslandStyle.gold : Color.white.opacity(0.1))
+-                )
++                .font(.system(size: 10.5, weight: selected ? .bold : .semibold))
++                .tracking(0.4)
++                .foregroundStyle(Color.white.opacity(selected ? 1 : 0.55))
++                .frame(width: option.width, height: 24)
++                .background {
++                    if selected {
++                        Color.clear
++                            .notchGlassCapsule(tint: Color.white.opacity(0.08))
++                            .matchedGeometryEffect(id: "language", in: languageSelection)
++                    }
++                }
+                 .contentShape(Capsule())
+@@ -683,2 +721,3 @@ struct NotchDictationSection: View {
+                     .font(.system(size: 9.5, weight: .bold))
++                    .foregroundStyle(NotchIslandStyle.gold)
+                 Text("Dictate", tableName: "NotchIsland")
+@@ -687,6 +726,6 @@ struct NotchDictationSection: View {
+             }
+-            .foregroundStyle(NotchIslandStyle.navy)
++            .foregroundStyle(Color.white)
+             .padding(.horizontal, 12)
+             .frame(height: 26)
+-            .background(Capsule().fill(NotchIslandStyle.gold))
++            .notchGlassCapsule()
+             .contentShape(Capsule())
+@@ -719,3 +758,3 @@ struct NotchDictationSection: View {
+             .frame(height: 24)
+-            .background(Capsule().fill(Color.white.opacity(0.16)))
++            .notchGlassCapsule()
+             .contentShape(Capsule())
+@@ -736,3 +775,3 @@ struct NotchDictationSection: View {
+             .frame(height: 24)
+-            .background(Capsule().fill(Color.white.opacity(0.1)))
++            .notchGlassCapsule()
+             .contentShape(Capsule())
+@@ -784,2 +823,14 @@ struct NotchPlayerPanel: View {
+                 NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
++                    .background {
++                        // A soft light in the cover's own colours, brighter while the song plays.
++                        if nowPlaying.artwork != nil {
++                            NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
++                                .saturation(1.4)
++                                .scaleEffect(1.3)
++                                .blur(radius: 18)
++                                .opacity(track.isPlaying ? 0.8 : 0.35)
++                                .animation(.easeInOut(duration: 0.6), value: track.isPlaying)
++                                .allowsHitTesting(false)
++                        }
++                    }
+ 
+@@ -815,4 +866,5 @@ struct NotchPlayerPanel: View {
+                 HStack(spacing: 32) {
+-                    controlButton(symbol: "backward.fill", size: 21) { nowPlaying.previous() }
+-                    controlButton(symbol: track.isPlaying ? "pause.fill" : "play.fill", size: 29) {
++                    // Smaller skip buttons, so play/pause is clearly the middle.
++                    controlButton(symbol: "backward.fill", size: 16) { nowPlaying.previous() }
++                    controlButton(symbol: track.isPlaying ? "pause.fill" : "play.fill", size: 31) {
+                         nowPlaying.playPause()
+@@ -820,3 +872,3 @@ struct NotchPlayerPanel: View {
+                     .contentTransition(.symbolEffect(.replace))
+-                    controlButton(symbol: "forward.fill", size: 21) { nowPlaying.next() }
++                    controlButton(symbol: "forward.fill", size: 16) { nowPlaying.next() }
+                 }
+@@ -863,6 +915,6 @@ struct NotchPlayerPanel: View {
+             }
+-            .foregroundStyle(open ? NotchIslandStyle.navy : Color.white.opacity(0.85))
++            .foregroundStyle(open ? NotchIslandStyle.gold : Color.white.opacity(0.85))
+             .padding(.horizontal, 10)
+             .frame(height: 26)
+-            .background(Capsule().fill(open ? NotchIslandStyle.gold : Color.white.opacity(0.12)))
++            .notchGlassCapsule(tint: open ? Color.white.opacity(0.1) : nil)
+             .contentShape(Capsule())
