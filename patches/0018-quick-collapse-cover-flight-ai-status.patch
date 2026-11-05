@@ -1,0 +1,328 @@
+diff --git a/VoiceInk/Core/Enhancement/AIPrompts.swift b/VoiceInk/Core/Enhancement/AIPrompts.swift
+index eb765e7..7dfa7cb 100644
+--- a/VoiceInk/Core/Enhancement/AIPrompts.swift
++++ b/VoiceInk/Core/Enhancement/AIPrompts.swift
+@@ -110,2 +110,3 @@ enum AIPrompts {
+         Return only the cleaned and polished text from <TRANSCRIPT>. Do not include explanations, answers, commentary, labels, tags, or metadata.
++        Before answering, go through the quotation-mark rules once more: direct speech, the exact text of messages, signs and errors, labels of buttons, menus, options, tabs and settings the speaker refers to, titles, and words the speaker talks about as words all need the quotation marks of the transcript’s language.
+         </OUTPUT_REQUIREMENTS>
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index 441b2f3..03c5ca9 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -19,2 +19,11 @@ enum NotchIslandSettings {
+ struct NotchLastDictation: Equatable {
++    enum AIState: Equatable {
++        /// Cleaned up by the AI (quotation marks, corrections …).
++        case used
++        /// The AI was asked but failed: plain transcript.
++        case failed
++        /// No AI clean-up for this dictation.
++        case off
++    }
++
+     let text: String
+@@ -22,2 +31,3 @@ struct NotchLastDictation: Equatable {
+     let status: TranscriptionStatus
++    let ai: AIState
+ }
+@@ -167,2 +177,4 @@ final class NotchIslandModel: ObservableObject {
+     var suppressHoverOpen = false
++    /// The pointer just left: the island shrinks with the quicker curve.
++    var collapsesQuickly = false
+ 
+@@ -297,6 +309,14 @@ final class NotchIslandModel: ObservableObject {
+         let status = last.transcriptionStatus.flatMap { TranscriptionStatus(rawValue: $0) } ?? .completed
++        // A failed clean-up leaves its error message in the enhanced text: then the plain one.
++        let ai: NotchLastDictation.AIState
++        if !enhanced.isEmpty, last.enhancementDuration != nil {
++            ai = .used
++        } else {
++            ai = enhanced.isEmpty ? .off : .failed
++        }
+         let dictation = NotchLastDictation(
+-            text: enhanced.isEmpty ? last.text : enhanced,
++            text: ai == .used ? enhanced : last.text,
+             date: last.timestamp,
+-            status: status
++            status: status,
++            ai: ai
+         )
+@@ -648,2 +668,3 @@ final class NotchIslandController {
+     private var hoverOpenTask: Task<Void, Never>?
++    private var collapseResetTask: Task<Void, Never>?
+     private var menuCloseTask: Task<Void, Never>?
+@@ -985,3 +1006,3 @@ final class NotchIslandController {
+             hoverExitTask = Task { @MainActor [weak self] in
+-                try? await Task.sleep(nanoseconds: 150_000_000)
++                try? await Task.sleep(nanoseconds: 60_000_000)
+                 guard let self, !Task.isCancelled else { return }
+@@ -989,3 +1010,3 @@ final class NotchIslandController {
+                 if !self.model.senses(NSEvent.mouseLocation) {
+-                    self.model.isHovering = false
++                    self.collapseQuickly { self.model.isHovering = false }
+                 }
+@@ -994,6 +1015,6 @@ final class NotchIslandController {
+ 
+-        // The menu folds away shortly after the pointer leaves it.
++        // The menu folds away right after the pointer leaves it.
+         if model.menuOpen, menuCloseTask == nil {
+             menuCloseTask = Task { @MainActor [weak self] in
+-                try? await Task.sleep(nanoseconds: 700_000_000)
++                try? await Task.sleep(nanoseconds: 120_000_000)
+                 guard let self, !Task.isCancelled else { return }
+@@ -1001,3 +1022,3 @@ final class NotchIslandController {
+                 if !self.model.senses(NSEvent.mouseLocation) {
+-                    self.model.closeMenu()
++                    self.collapseQuickly { self.model.closeMenu() }
+                 }
+@@ -1007,2 +1028,14 @@ final class NotchIslandController {
+ 
++    /// Shrinks the island with the quicker ease-in-out curve (the pointer has left it).
++    private func collapseQuickly(_ change: () -> Void) {
++        model.collapsesQuickly = true
++        change()
++        collapseResetTask?.cancel()
++        collapseResetTask = Task { @MainActor [weak self] in
++            try? await Task.sleep(nanoseconds: 450_000_000)
++            guard let self, !Task.isCancelled else { return }
++            self.model.collapsesQuickly = false
++        }
++    }
++
+     /// Opens the notch by itself once the pointer rests on it for a moment, no click needed.
+@@ -1050,3 +1083,6 @@ final class NotchIslandController {
+         // Always tracked: animates together with the island while the glow shows.
+-        screenGlow.setIsland(glowIsland(for: phase))
++        screenGlow.setIsland(
++            glowIsland(for: phase),
++            duration: model.collapsesQuickly ? NotchIslandStyle.collapseDuration : NotchIslandStyle.morphDuration
++        )
+     }
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index a809539..d78ee53 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -105,3 +105,3 @@ final class NotchScreenGlowWindow {
+     /// glow is hidden: then the outline jumps, while visible it animates like the island.
+-    func setIsland(_ newIsland: NotchGlowIsland) {
++    func setIsland(_ newIsland: NotchGlowIsland, duration: CFTimeInterval = NotchScreenGlowWindow.islandDuration) {
+         guard newIsland != island else { return }
+@@ -110,3 +110,2 @@ final class NotchScreenGlowWindow {
+         let now = CACurrentMediaTime()
+-        let duration = NotchScreenGlowWindow.islandDuration
+ 
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index ad3f012..5f7fe92 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -10,3 +10,7 @@ enum NotchIslandStyle {
+     /// Smooth ease-in-out for every size change of the island.
+-    static let morph = Animation.timingCurve(0.4, 0, 0.2, 1, duration: 0.42)
++    static let morphDuration: Double = 0.42
++    static let morph = Animation.timingCurve(0.4, 0, 0.2, 1, duration: morphDuration)
++    /// The same curve, quicker, when the pointer leaves and the island shrinks back.
++    static let collapseDuration: Double = 0.26
++    static let collapse = Animation.timingCurve(0.4, 0, 0.2, 1, duration: collapseDuration)
+ 
+@@ -75,2 +79,5 @@ struct NotchIslandView: View {
+ 
++    /// The album cover moves between its small spot beside the notch and the player.
++    @Namespace private var coverSpace
++
+     /// The notch is being pressed: it gives way a little, like a button. Resets by itself when the
+@@ -109,3 +116,3 @@ struct NotchIslandView: View {
+         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+-        .animation(NotchIslandStyle.morph, value: phase)
++        .animation(model.collapsesQuickly ? NotchIslandStyle.collapse : NotchIslandStyle.morph, value: phase)
+         .animation(NotchIslandStyle.morph, value: model.geometry)
+@@ -272,2 +279,17 @@ struct NotchIslandView: View {
+     private func leftWing(phase: NotchIslandPhase) -> some View {
++        Group {
++            if model.music != nil, phase == .music || phase == .hover || phase == .menu {
++                // One view for all of these, so the cover never blinks between them; it flies into
++                // the player when that opens.
++                NotchMusicArtwork(nowPlaying: model.nowPlaying, size: 22, cornerRadius: 6, namespace: coverSpace)
++            } else {
++                otherLeftWing(phase: phase)
++            }
++        }
++        .transition(.opacity)
++        .animation(.easeOut(duration: 0.18).delay(0.06), value: phase)
++    }
++
++    @ViewBuilder
++    private func otherLeftWing(phase: NotchIslandPhase) -> some View {
+         Group {
+@@ -275,11 +297,7 @@ struct NotchIslandView: View {
+             case .music:
+-                NotchMusicArtwork(nowPlaying: model.nowPlaying, size: 22, cornerRadius: 6)
++                Color.clear
+             case .hover, .menu:
+-                if model.music != nil {
+-                    NotchMusicArtwork(nowPlaying: model.nowPlaying, size: 22, cornerRadius: 6)
+-                } else {
+-                    Image(systemName: "mic.fill")
+-                        .font(.system(size: 11, weight: .semibold))
+-                        .foregroundStyle(Color.white.opacity(0.9))
+-                }
++                Image(systemName: "mic.fill")
++                    .font(.system(size: 11, weight: .semibold))
++                    .foregroundStyle(Color.white.opacity(0.9))
+             case .dropReady, .dropTarget:
+@@ -309,4 +327,2 @@ struct NotchIslandView: View {
+         }
+-        .transition(.opacity)
+-        .animation(.easeOut(duration: 0.18).delay(0.06), value: phase)
+     }
+@@ -483,3 +499,9 @@ struct NotchIslandView: View {
+         if phase == .player {
+-            NotchPlayerPanel(model: model, nowPlaying: model.nowPlaying, onDictate: onTap, onRetry: onRetryLast)
++            NotchPlayerPanel(
++                model: model,
++                nowPlaying: model.nowPlaying,
++                coverSpace: coverSpace,
++                onDictate: onTap,
++                onRetry: onRetryLast
++            )
+                 .transition(.opacity)
+@@ -618,3 +640,12 @@ struct NotchDictationSection: View {
+ 
+-        let when = Text(verbatim: " · " + Self.relativeTime(last.date))
++        var when = Text(verbatim: " · " + Self.relativeTime(last.date))
++        // Shows at a glance when the AI (quotation marks, corrections …) did not run.
++        switch last.ai {
++        case .used:
++            break
++        case .off:
++            when = when + Text(verbatim: " · ") + Text("without AI", tableName: "NotchIsland")
++        case .failed:
++            when = when + Text(verbatim: " · ") + Text("AI failed", tableName: "NotchIsland")
++        }
+ 
+@@ -789,2 +820,3 @@ struct NotchPlayerPanel: View {
+     @ObservedObject var nowPlaying: NotchNowPlaying
++    let coverSpace: Namespace.ID
+     let onDictate: () -> Void
+@@ -822,14 +854,5 @@ struct NotchPlayerPanel: View {
+             HStack(spacing: 14) {
+-                NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
++                NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12, namespace: coverSpace)
+                     .background {
+-                        // A soft light in the cover's own colours, brighter while the song plays.
+-                        if nowPlaying.artwork != nil {
+-                            NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
+-                                .saturation(1.4)
+-                                .scaleEffect(1.3)
+-                                .blur(radius: 18)
+-                                .opacity(track.isPlaying ? 0.8 : 0.35)
+-                                .animation(.easeInOut(duration: 0.6), value: track.isPlaying)
+-                                .allowsHitTesting(false)
+-                        }
++                        coverGlow(isPlaying: track.isPlaying)
+                     }
+@@ -891,2 +914,25 @@ struct NotchPlayerPanel: View {
+ 
++    /// The cover's own colours shining out behind it: a wide soft light and a closer, brighter one.
++    /// Stronger while the song plays.
++    @ViewBuilder
++    private func coverGlow(isPlaying: Bool) -> some View {
++        if nowPlaying.artwork != nil {
++            ZStack {
++                NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
++                    .scaleEffect(2.1)
++                    .blur(radius: 30)
++                    .opacity(0.6)
++                NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
++                    .scaleEffect(1.25)
++                    .blur(radius: 12)
++                    .opacity(0.8)
++            }
++            .saturation(1.6)
++            .brightness(0.06)
++            .opacity(isPlaying ? 1 : 0.45)
++            .animation(.easeInOut(duration: 0.6), value: isPlaying)
++            .allowsHitTesting(false)
++        }
++    }
++
+     private func controlButton(symbol: String, size: CGFloat, action: @escaping () -> Void) -> some View {
+@@ -990,2 +1036,5 @@ struct NotchMusicArtwork: View {
+     let cornerRadius: CGFloat
++    /// Shared between the small cover beside the notch and the one in the player, so it moves and
++    /// grows from one to the other.
++    var namespace: Namespace.ID? = nil
+ 
+@@ -1005,4 +1054,6 @@ struct NotchMusicArtwork: View {
+         }
++        // Corners in proportion, so they stay right while the cover grows or shrinks.
++        .clipShape(NotchProportionalRoundedRect(ratio: cornerRadius / max(size, 1)))
++        .notchMatchedCover(in: namespace)
+         .frame(width: size, height: size)
+-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+         .animation(.easeOut(duration: 0.25), value: nowPlaying.artwork != nil)
+@@ -1011,2 +1062,22 @@ struct NotchMusicArtwork: View {
+ 
++/// A rounded rectangle whose corner radius is a share of its size.
++struct NotchProportionalRoundedRect: Shape {
++    let ratio: CGFloat
++
++    func path(in rect: CGRect) -> Path {
++        Path(roundedRect: rect, cornerRadius: min(rect.width, rect.height) * ratio, style: .continuous)
++    }
++}
++
++extension View {
++    @ViewBuilder
++    fileprivate func notchMatchedCover(in namespace: Namespace.ID?) -> some View {
++        if let namespace {
++            matchedGeometryEffect(id: "notchCover", in: namespace)
++        } else {
++            self
++        }
++    }
++}
++
+ /// Small gold bars that move while music plays.
+diff --git a/VoiceInk/NotchIsland.xcstrings b/VoiceInk/NotchIsland.xcstrings
+index daa40cb..5dff251 100644
+--- a/VoiceInk/NotchIsland.xcstrings
++++ b/VoiceInk/NotchIsland.xcstrings
+@@ -3,2 +3,18 @@
+   "strings" : {
++    "AI failed" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "KI fehlgeschlagen"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "échec de l’IA"
++          }
++        }
++      }
++    },
+     "AirDrop is not available." : {
+@@ -370,2 +386,18 @@
+       }
++    },
++    "without AI" : {
++      "localizations" : {
++        "de" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "ohne KI"
++          }
++        },
++        "fr" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "sans IA"
++          }
++        }
++      }
+     }
