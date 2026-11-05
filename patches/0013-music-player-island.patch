@@ -1,0 +1,669 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index 581f23e..0d2a080 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -72,6 +72,8 @@ enum NotchIslandPhase: Equatable {
+     case hover
+     /// Opened by a click: language choice and the last dictation to copy.
+     case menu
++    /// Opened by a click while music plays: the island becomes a player (dictation folds out).
++    case player
+     /// Listening. Slightly larger than the notch and glowing.
+     case recording
+     /// Transcribing / AI clean-up.
+@@ -92,7 +94,7 @@ enum NotchIslandPhase: Equatable {
+     var isActive: Bool {
+         switch self {
+         case .recording, .processing, .liveText, .assistant: return true
+-        case .hidden, .idle, .hover, .menu, .music, .dropReady, .dropTarget, .fileTask: return false
++        case .hidden, .idle, .hover, .menu, .player, .music, .dropReady, .dropTarget, .fileTask: return false
+         }
+     }
+ 
+@@ -100,7 +102,8 @@ enum NotchIslandPhase: Equatable {
+     var showsScreenGlow: Bool {
+         switch self {
+         case .recording, .liveText, .processing: return true
+-        case .hidden, .idle, .hover, .menu, .assistant, .music, .dropReady, .dropTarget, .fileTask: return false
++        case .hidden, .idle, .hover, .menu, .player, .assistant, .music, .dropReady, .dropTarget, .fileTask:
++            return false
+         }
+     }
+ 
+@@ -122,6 +125,8 @@ final class NotchIslandModel: ObservableObject {
+     @Published private(set) var assistantVisible = false
+     /// The click menu (language + last dictation) is open.
+     @Published private(set) var menuOpen = false
++    /// In the player: the dictation part (language, last dictation) is folded out.
++    @Published var playerShowsDictation = false
+     /// Latest streaming text of the current or last recording. Kept after the recording ends,
+     /// so it can still be copied when the final transcription fails.
+     @Published private(set) var lastLiveText = ""
+@@ -149,15 +154,17 @@ final class NotchIslandModel: ObservableObject {
+     static let musicWing: CGFloat = 46
+     static let dropReadyWing: CGFloat = 66
+     static let dropTargetWing: CGFloat = 130
++    static let playerWing: CGFloat = 130
+     static let rowBonus: CGFloat = 5
+     static let liveTextPanelHeight: CGFloat = 57
+     static let assistantPanelHeight: CGFloat = 320
+     static let dropPanelHeight: CGFloat = 90
++    static let playerPanelHeight: CGFloat = 156
++    static let playerDictationHeight: CGFloat = 138
+     /// Side padding of the drop targets inside the island.
+     static let dropPanelInset: CGFloat = 14
+     /// Glass cards that drop down below the island.
+     static let menuCardSize = CGSize(width: 380, height: 150)
+-    static let musicMenuCardSize = CGSize(width: 380, height: 222)
+     static let fileTaskCardSize = CGSize(width: 380, height: 96)
+     static let cardGap: CGFloat = 8
+     /// Room around the island for the glow.
+@@ -221,6 +228,7 @@ final class NotchIslandModel: ObservableObject {
+ 
+     func openMenu() {
+         reloadLastDictation()
++        playerShowsDictation = false
+         menuOpen = true
+     }
+ 
+@@ -228,6 +236,9 @@ final class NotchIslandModel: ObservableObject {
+         if menuOpen {
+             menuOpen = false
+         }
++        if playerShowsDictation {
++            playerShowsDictation = false
++        }
+     }
+ 
+     func reloadLastDictation() {
+@@ -266,7 +277,7 @@ final class NotchIslandModel: ObservableObject {
+         }
+ 
+         if fileDrag != nil { return isHovering ? .dropTarget : .dropReady }
+-        if menuOpen { return .menu }
++        if menuOpen { return music != nil ? .player : .menu }
+         if fileTask != nil { return .fileTask }
+         if isHovering { return .hover }
+         if music?.isPlaying == true { return .music }
+@@ -307,13 +318,16 @@ final class NotchIslandModel: ObservableObject {
+             return CGSize(width: width + Self.dropReadyWing * 2, height: row)
+         case .dropTarget:
+             return CGSize(width: width + Self.dropTargetWing * 2, height: row + Self.dropPanelHeight)
++        case .player:
++            let dictation = playerShowsDictation ? Self.playerDictationHeight : 0
++            return CGSize(width: width + Self.playerWing * 2, height: row + Self.playerPanelHeight + dictation)
+         }
+     }
+ 
+     /// Glass card shown below the island in this phase.
+     func cardSize(for phase: NotchIslandPhase) -> CGSize? {
+         switch phase {
+-        case .menu: return music != nil ? Self.musicMenuCardSize : Self.menuCardSize
++        case .menu: return Self.menuCardSize
+         case .fileTask: return Self.fileTaskCardSize
+         default: return nil
+         }
+@@ -323,15 +337,20 @@ final class NotchIslandModel: ObservableObject {
+     var windowSize: CGSize {
+         let assistant = size(for: .assistant)
+         let dropTarget = size(for: .dropTarget)
++        // The player at its largest (dictation folded out).
++        let player = CGSize(
++            width: geometry.notchWidth + Self.playerWing * 2,
++            height: geometry.notchHeight + Self.rowBonus + Self.playerPanelHeight + Self.playerDictationHeight
++        )
+         let island = size(for: .menu)
+-        let cards = [Self.menuCardSize, Self.musicMenuCardSize, Self.fileTaskCardSize]
++        let cards = [Self.menuCardSize, Self.fileTaskCardSize]
+         let cardWidth = cards.map(\.width).max() ?? 0
+         let cardHeight = cards.map(\.height).max() ?? 0
+         let menuWidth = max(island.width, cardWidth)
+         let menuHeight = island.height + Self.cardGap + cardHeight
+         return CGSize(
+-            width: max(assistant.width, dropTarget.width, menuWidth) + Self.glowPadding * 2,
+-            height: max(assistant.height, dropTarget.height, menuHeight) + Self.glowPadding
++            width: max(assistant.width, dropTarget.width, player.width, menuWidth) + Self.glowPadding * 2,
++            height: max(assistant.height, dropTarget.height, player.height, menuHeight) + Self.glowPadding
+         )
+     }
+ 
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift b/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
+index 1219c51..b42698a 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
+@@ -31,6 +31,13 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+         var isRunning: Bool {
+             !NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).isEmpty
+         }
++
++        var icon: NSImage? {
++            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
++                return nil
++            }
++            return NSWorkspace.shared.icon(forFile: url.path)
++        }
+     }
+ 
+     struct Track: Equatable {
+@@ -42,14 +49,27 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+         var id: String { player.rawValue + "|" + title + "|" + artist }
+     }
+ 
++    /// Playback position at a moment; while playing it runs on from there.
++    struct Position: Equatable {
++        var seconds: Double
++        var date: Date
++    }
++
+     private struct PlayerInfo: Sendable {
+         let state: String?
+         let title: String?
+         let artist: String?
++        /// Seconds (Spotify sends it with every change).
++        var position: Double?
++        /// Seconds.
++        var duration: Double?
+     }
+ 
+     @Published private(set) var track: Track?
+     @Published private(set) var artwork: NSImage?
++    /// Length of the current track in seconds, when known.
++    @Published private(set) var duration: Double?
++    @Published private(set) var position = Position(seconds: 0, date: Date())
+ 
+     private var artworkID: String?
+ 
+@@ -97,10 +117,53 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+         guard var current = track else { return }
+         send("playpause")
+         // Shown at once; the player's notification confirms it a moment later.
++        anchorPosition()
+         current.isPlaying.toggle()
+         track = current
+     }
+ 
++    /// Where the track is right now (runs on between updates from the player).
++    func seconds(at date: Date) -> Double {
++        var value = position.seconds
++        if track?.isPlaying == true {
++            value += date.timeIntervalSince(position.date)
++        }
++        if let duration {
++            value = min(value, duration)
++        }
++        return max(0, value)
++    }
++
++    /// Asks the player for the exact position and length (when the player view opens).
++    func refreshPosition() {
++        guard let player = track?.player, player.isRunning else { return }
++        let source = Self.script(for: player, "return {player position, duration of current track}")
++        Task { @MainActor [weak self] in
++            guard let numbers = await NotchAppleScript.run(source)?.numbers, numbers.count >= 2,
++                let self, self.track?.player == player
++            else { return }
++            // Spotify counts the length in milliseconds, Music in seconds.
++            let length = player == .spotify ? numbers[1] / 1000 : numbers[1]
++            self.duration = length > 0 ? length : nil
++            self.position = Position(seconds: max(0, numbers[0]), date: Date())
++        }
++    }
++
++    /// Jumps to a point of the track (0...1).
++    func seek(to fraction: Double) {
++        guard let player = track?.player, let duration, player.isRunning else { return }
++        let target = Int((max(0, min(1, fraction)) * duration).rounded())
++        position = Position(seconds: Double(target), date: Date())
++        let source = Self.script(for: player, "set player position to " + String(target))
++        Task {
++            _ = await NotchAppleScript.run(source)
++        }
++    }
++
++    private func anchorPosition() {
++        position = Position(seconds: seconds(at: Date()), date: Date())
++    }
++
+     func next() {
+         send("next track")
+     }
+@@ -144,10 +207,14 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+ 
+     nonisolated private static func info(from notification: Notification) -> PlayerInfo {
+         let info = notification.userInfo ?? [:]
++        // Spotify: "Duration" in ms and "Playback Position" in s; Music: "Total Time" in ms.
++        let milliseconds = (info["Duration"] as? NSNumber) ?? (info["Total Time"] as? NSNumber)
+         return PlayerInfo(
+             state: info["Player State"] as? String,
+             title: info["Name"] as? String,
+-            artist: info["Artist"] as? String
++            artist: info["Artist"] as? String,
++            position: (info["Playback Position"] as? NSNumber)?.doubleValue,
++            duration: milliseconds.map { $0.doubleValue / 1000 }
+         )
+     }
+ 
+@@ -163,6 +230,7 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+         guard let title = info.title, !title.isEmpty else {
+             // Only the state changed.
+             if var current = track, current.player == player, info.state != nil {
++                anchorPosition()
+                 current.isPlaying = playing
+                 track = current
+             }
+@@ -175,16 +243,34 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+         }
+ 
+         let newTrack = Track(player: player, title: title, artist: info.artist ?? "", isPlaying: playing)
++        let changedTrack = newTrack.id != track?.id
++        if changedTrack {
++            duration = info.duration
++            position = Position(seconds: info.position ?? 0, date: Date())
++        } else {
++            if let length = info.duration, length > 0 {
++                duration = length
++            }
++            if let seconds = info.position {
++                position = Position(seconds: seconds, date: Date())
++            } else {
++                anchorPosition()
++            }
++        }
+         if newTrack != track {
+             track = newTrack
+         }
+         loadArtworkIfNeeded()
++        if changedTrack, info.position == nil {
++            refreshPosition()
++        }
+     }
+ 
+     private func clear() {
+         track = nil
+         artwork = nil
+         artworkID = nil
++        duration = nil
+     }
+ 
+     private func refreshFromRunningPlayers() {
+@@ -264,6 +350,8 @@ enum NotchAppleScript {
+     struct Result: Sendable {
+         let string: String?
+         let data: Data?
++        /// The numbers of a returned list.
++        let numbers: [Double]
+     }
+ 
+     private static let queue = DispatchQueue(label: "com.prakashjoshipax.voiceink.notch-applescript", qos: .userInitiated)
+@@ -277,7 +365,18 @@ enum NotchAppleScript {
+                     continuation.resume(returning: nil)
+                     return
+                 }
+-                continuation.resume(returning: Result(string: descriptor.stringValue, data: descriptor.data))
++                var numbers: [Double] = []
++                let count = descriptor.numberOfItems
++                if count > 0 {
++                    for index in 1...count {
++                        if let item = descriptor.atIndex(index) {
++                            numbers.append(item.doubleValue)
++                        }
++                    }
++                }
++                continuation.resume(
++                    returning: Result(string: descriptor.stringValue, data: descriptor.data, numbers: numbers)
++                )
+             }
+         }
+     }
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 0df6bce..e08207e 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -83,6 +83,7 @@ struct NotchIslandView: View {
+         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+         .animation(NotchIslandStyle.morph, value: phase)
+         .animation(NotchIslandStyle.morph, value: model.geometry)
++        .animation(NotchIslandStyle.morph, value: model.playerShowsDictation)
+     }
+ 
+     // MARK: - Island
+@@ -97,6 +98,7 @@ struct NotchIslandView: View {
+             liveTextPanel(phase: phase)
+             assistantPanel(phase: phase)
+             dropPanel(phase: phase)
++            playerPanel(phase: phase)
+         }
+         .frame(width: size.width, height: size.height, alignment: .top)
+         .background(Color.black)
+@@ -127,6 +129,8 @@ struct NotchIslandView: View {
+             return NotchIslandShape(topCornerRadius: 8, bottomCornerRadius: 14)
+         case .liveText, .assistant, .dropTarget:
+             return NotchIslandShape(topCornerRadius: 12, bottomCornerRadius: 22)
++        case .player:
++            return NotchIslandShape(topCornerRadius: 12, bottomCornerRadius: 28)
+         }
+     }
+ 
+@@ -169,7 +173,7 @@ struct NotchIslandView: View {
+             switch phase {
+             case .hidden, .idle, .hover, .music:
+                 model.openMenu()
+-            case .menu:
++            case .menu, .player:
+                 model.closeMenu()
+             case .recording, .liveText:
+                 onTap()
+@@ -209,7 +213,7 @@ struct NotchIslandView: View {
+                 } else {
+                     targetAppBadge(phase: phase)
+                 }
+-            case .hidden, .idle:
++            case .hidden, .idle, .player:
+                 Color.clear
+             }
+         }
+@@ -283,7 +287,7 @@ struct NotchIslandView: View {
+                 } else {
+                     Color.clear
+                 }
+-            case .hidden, .idle:
++            case .hidden, .idle, .player:
+                 Color.clear
+             }
+         }
+@@ -339,6 +343,14 @@ struct NotchIslandView: View {
+         }
+     }
+ 
++    @ViewBuilder
++    private func playerPanel(phase: NotchIslandPhase) -> some View {
++        if phase == .player {
++            NotchPlayerPanel(model: model, nowPlaying: model.nowPlaying, onDictate: onTap, onRetry: onRetryLast)
++                .transition(.opacity)
++        }
++    }
++
+     @ViewBuilder
+     private func assistantPanel(phase: NotchIslandPhase) -> some View {
+         if phase == .assistant {
+@@ -380,6 +392,25 @@ struct NotchMenuCard: View {
+     let onDictate: () -> Void
+     let onRetry: () -> Void
+ 
++    var body: some View {
++        NotchDictationSection(model: model, onDictate: onDictate, onRetry: onRetry)
++            .padding(14)
++            .frame(
++                width: NotchIslandModel.menuCardSize.width,
++                height: NotchIslandModel.menuCardSize.height,
++                alignment: .topLeading
++            )
++            .notchGlassCard(cornerRadius: 22)
++            .environment(\.colorScheme, .dark)
++    }
++}
++
++/// Language, dictate button and the last dictation (in the menu card and in the player).
++struct NotchDictationSection: View {
++    @ObservedObject var model: NotchIslandModel
++    let onDictate: () -> Void
++    let onRetry: () -> Void
++
+     @AppStorage("SelectedLanguage") private var selectedLanguage = "en"
+     @State private var copied = false
+ 
+@@ -393,17 +424,8 @@ struct NotchMenuCard: View {
+ 
+     var body: some View {
+         let content = makeContent()
+-        let size = model.music != nil ? NotchIslandModel.musicMenuCardSize : NotchIslandModel.menuCardSize
+ 
+         VStack(alignment: .leading, spacing: 0) {
+-            if let music = model.music {
+-                NotchMusicSection(track: music, nowPlaying: model.nowPlaying)
+-                Rectangle()
+-                    .fill(Color.white.opacity(0.12))
+-                    .frame(height: 1)
+-                    .padding(.vertical, 12)
+-            }
+-
+             HStack(spacing: 6) {
+                 ForEach(NotchLanguageOption.all) { option in
+                     languageChip(option)
+@@ -436,10 +458,7 @@ struct NotchMenuCard: View {
+             }
+             .padding(.top, 6)
+         }
+-        .padding(14)
+-        .frame(width: size.width, height: size.height, alignment: .topLeading)
+-        .notchGlassCard(cornerRadius: 22)
+-        .environment(\.colorScheme, .dark)
++        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+     }
+ 
+     private func makeContent() -> Content {
+@@ -605,57 +624,193 @@ struct NotchMenuCard: View {
+ 
+ // MARK: - Music
+ 
+-/// Cover, title and the buttons, at the top of the menu card while music plays.
+-struct NotchMusicSection: View {
+-    let track: NotchNowPlaying.Track
++/// The island as a music player (opened by a click while music plays), like the Dynamic Island:
++/// cover, title, progress, big buttons. A small microphone button folds out the dictation part.
++struct NotchPlayerPanel: View {
++    @ObservedObject var model: NotchIslandModel
+     @ObservedObject var nowPlaying: NotchNowPlaying
++    let onDictate: () -> Void
++    let onRetry: () -> Void
+ 
+     var body: some View {
+-        HStack(spacing: 12) {
+-            NotchMusicArtwork(nowPlaying: nowPlaying, size: 46, cornerRadius: 10)
++        VStack(spacing: 0) {
++            if let track = nowPlaying.track {
++                player(track)
++                    .frame(height: NotchIslandModel.playerPanelHeight)
++            } else {
++                Color.clear
++                    .frame(height: NotchIslandModel.playerPanelHeight)
++            }
+ 
+-            VStack(alignment: .leading, spacing: 3) {
+-                Text(verbatim: track.title)
+-                    .font(.system(size: 13, weight: .semibold))
+-                    .foregroundStyle(Color.white)
+-                    .lineLimit(1)
+-                Text(verbatim: track.artist)
+-                    .font(.system(size: 11.5))
+-                    .foregroundStyle(Color.white.opacity(0.6))
+-                    .lineLimit(1)
++            if model.playerShowsDictation {
++                VStack(spacing: 0) {
++                    Rectangle()
++                        .fill(Color.white.opacity(0.1))
++                        .frame(height: 1)
++                    NotchDictationSection(model: model, onDictate: onDictate, onRetry: onRetry)
++                        .padding(.top, 14)
++                        .padding(.bottom, 16)
++                }
++                .padding(.horizontal, 20)
++                .frame(height: NotchIslandModel.playerDictationHeight)
++                .transition(.opacity)
++            }
++        }
++        .environment(\.colorScheme, .dark)
++    }
++
++    private func player(_ track: NotchNowPlaying.Track) -> some View {
++        VStack(spacing: 0) {
++            HStack(spacing: 14) {
++                NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
++
++                VStack(alignment: .leading, spacing: 3) {
++                    Text(verbatim: track.title)
++                        .font(.system(size: 15.5, weight: .semibold))
++                        .foregroundStyle(Color.white)
++                        .lineLimit(1)
++                    Text(verbatim: track.artist)
++                        .font(.system(size: 13, weight: .medium))
++                        .foregroundStyle(Color.white.opacity(0.55))
++                        .lineLimit(1)
++                }
++
++                Spacer(minLength: 8)
++
++                VStack(alignment: .trailing, spacing: 9) {
++                    NotchMusicBars(isPlaying: track.isPlaying)
++                    if let icon = track.player.icon {
++                        Image(nsImage: icon)
++                            .resizable()
++                            .interpolation(.high)
++                            .frame(width: 18, height: 18)
++                    }
++                }
+             }
++            .frame(height: 58)
+ 
+-            Spacer(minLength: 8)
++            NotchPlayerProgress(nowPlaying: nowPlaying)
++                .padding(.top, 14)
+ 
+-            HStack(spacing: 6) {
+-                controlButton(symbol: "backward.fill", size: 12) { nowPlaying.previous() }
+-                controlButton(symbol: track.isPlaying ? "pause.fill" : "play.fill", size: 15, prominent: true) {
+-                    nowPlaying.playPause()
++            ZStack {
++                HStack(spacing: 42) {
++                    controlButton(symbol: "backward.fill", size: 21) { nowPlaying.previous() }
++                    controlButton(symbol: track.isPlaying ? "pause.fill" : "play.fill", size: 29) {
++                        nowPlaying.playPause()
++                    }
++                    controlButton(symbol: "forward.fill", size: 21) { nowPlaying.next() }
++                }
++
++                HStack {
++                    Spacer()
++                    dictationToggle
+                 }
+-                controlButton(symbol: "forward.fill", size: 12) { nowPlaying.next() }
+             }
++            .frame(height: 40)
++            .padding(.top, 10)
++        }
++        .padding(.horizontal, 20)
++        .padding(.top, 6)
++        .padding(.bottom, 14)
++        .task(id: track.id) {
++            nowPlaying.refreshPosition()
+         }
+-        .frame(height: 46)
+     }
+ 
+-    private func controlButton(
+-        symbol: String,
+-        size: CGFloat,
+-        prominent: Bool = false,
+-        action: @escaping () -> Void
+-    ) -> some View {
++    private func controlButton(symbol: String, size: CGFloat, action: @escaping () -> Void) -> some View {
+         Button(action: action) {
+             Image(systemName: symbol)
+                 .font(.system(size: size, weight: .bold))
+-                .foregroundStyle(prominent ? NotchIslandStyle.navy : Color.white.opacity(0.9))
+-                .frame(width: prominent ? 36 : 30, height: prominent ? 36 : 30)
+-                .background(Circle().fill(prominent ? NotchIslandStyle.gold : Color.white.opacity(0.1)))
+-                .contentShape(Circle())
++                .foregroundStyle(Color.white)
++                .frame(width: 44, height: 40)
++                .contentShape(Rectangle())
++        }
++        .buttonStyle(.plain)
++    }
++
++    /// Small microphone with an arrow: folds the dictation part (language, last dictation) out.
++    private var dictationToggle: some View {
++        let open = model.playerShowsDictation
++        return Button {
++            model.playerShowsDictation.toggle()
++        } label: {
++            HStack(spacing: 4) {
++                Image(systemName: "mic.fill")
++                    .font(.system(size: 11, weight: .bold))
++                Image(systemName: "chevron.down")
++                    .font(.system(size: 9, weight: .bold))
++                    .rotationEffect(.degrees(open ? 180 : 0))
++            }
++            .foregroundStyle(open ? NotchIslandStyle.navy : Color.white.opacity(0.85))
++            .padding(.horizontal, 10)
++            .frame(height: 26)
++            .background(Capsule().fill(open ? NotchIslandStyle.gold : Color.white.opacity(0.12)))
++            .contentShape(Capsule())
+         }
+         .buttonStyle(.plain)
+     }
+ }
+ 
++/// Progress bar with elapsed and remaining time; click or drag on it to jump.
++struct NotchPlayerProgress: View {
++    @ObservedObject var nowPlaying: NotchNowPlaying
++
++    @State private var dragFraction: Double?
++
++    var body: some View {
++        TimelineView(.periodic(from: .now, by: 0.5)) { context in
++            let duration = nowPlaying.duration ?? 0
++            let elapsed = nowPlaying.seconds(at: context.date)
++            let fraction = dragFraction ?? (duration > 0 ? min(1, elapsed / duration) : 0)
++            let shown = duration > 0 ? fraction * duration : elapsed
++
++            HStack(spacing: 10) {
++                Text(verbatim: Self.format(shown))
++                    .frame(width: 38, alignment: .leading)
++
++                GeometryReader { proxy in
++                    ZStack(alignment: .leading) {
++                        Capsule()
++                            .fill(Color.white.opacity(0.18))
++                        Capsule()
++                            .fill(Color.white.opacity(0.9))
++                            .frame(width: max(4, proxy.size.width * fraction))
++                    }
++                    .frame(height: dragFraction == nil ? 4 : 6)
++                    .frame(maxHeight: .infinity)
++                    .contentShape(Rectangle())
++                    .gesture(
++                        DragGesture(minimumDistance: 0)
++                            .onChanged { value in
++                                guard duration > 0, proxy.size.width > 0 else { return }
++                                dragFraction = max(0, min(1, value.location.x / proxy.size.width))
++                            }
++                            .onEnded { value in
++                                guard duration > 0, proxy.size.width > 0 else { return }
++                                nowPlaying.seek(to: max(0, min(1, value.location.x / proxy.size.width)))
++                                dragFraction = nil
++                            }
++                    )
++                }
++                .frame(height: 14)
++
++                Text(verbatim: duration > 0 ? "-" + Self.format(max(0, duration - shown)) : "")
++                    .frame(width: 42, alignment: .trailing)
++            }
++            .font(.system(size: 11, weight: .medium).monospacedDigit())
++            .foregroundStyle(Color.white.opacity(0.5))
++            .animation(.easeOut(duration: 0.15), value: dragFraction == nil)
++        }
++    }
++
++    private static func format(_ seconds: Double) -> String {
++        let total = Int(seconds.rounded(.down))
++        let minutes = total / 60
++        let rest = total % 60
++        return String(minutes) + ":" + (rest < 10 ? "0" : "") + String(rest)
++    }
++}
++
+ /// Album cover, or a note while there is none.
+ struct NotchMusicArtwork: View {
+     @ObservedObject var nowPlaying: NotchNowPlaying
