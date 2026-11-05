@@ -1,0 +1,55 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index d3ca2a2..f7f0e63 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -18,8 +18,8 @@ struct NotchGlowIsland: Equatable {
+ /// the island's sides and bottom. The island outline is animated here with the same curve and
+ /// duration the island itself uses, so the line always grows and shrinks together with the island.
+ /// The voice makes the line clearly thicker and lets the glow reach further. The colours run all
+-/// around the edge at once like Apple's light: PromoPulse gold, coral, violet, blue and a little
+-/// white, drifting slowly.
++/// around the edge at once like Apple's light: PromoPulse gold, warm and icy white, light blue,
++/// PromoPulse blue and a hint of blue-violet, drifting slowly.
+ @MainActor
+ final class NotchScreenGlowWindow {
+     enum Mode {
+@@ -461,11 +461,13 @@ enum NotchGlowShader {
+             float4 position [[position]];
+         };
+ 
+-        // PromoPulse gold and its gradient, coral, PromoPulse violet and blue, a little white.
+-        constant float3 paletteStops[8] = {
+-            float3(0.992f, 0.792f, 0.247f), float3(1.000f, 0.851f, 0.471f), float3(0.988f, 0.639f, 0.067f),
+-            float3(1.000f, 0.420f, 0.545f), float3(0.655f, 0.593f, 0.967f), float3(0.240f, 0.435f, 0.910f),
+-            float3(0.860f, 0.900f, 1.000f), float3(0.992f, 0.792f, 0.247f)
++        // PromoPulse gold and its gradient, warm and icy white, light blue, PromoPulse blue and a
++        // hint of blue-violet. Between gold and blue the light passes through white, never grey.
++        constant float3 paletteStops[11] = {
++            float3(0.992f, 0.792f, 0.247f), float3(0.988f, 0.639f, 0.067f), float3(1.000f, 0.851f, 0.471f),
++            float3(1.000f, 0.953f, 0.851f), float3(0.863f, 0.910f, 1.000f), float3(0.553f, 0.702f, 1.000f),
++            float3(0.240f, 0.435f, 0.910f), float3(0.416f, 0.424f, 0.949f), float3(0.240f, 0.435f, 0.910f),
++            float3(0.863f, 0.910f, 1.000f), float3(0.992f, 0.792f, 0.247f)
+         };
+ 
+         constant float3 silverStops[7] = {
+@@ -498,7 +500,8 @@ enum NotchGlowShader {
+             float x = fract(u) * segments;
+             int index = min(int(floor(x)), int(segments) - 1);
+             float f = x - float(index);
+-            f = f * f * (3.0f - 2.0f * f);
++            // Mostly linear, so the colours flow into each other instead of resting on each stop.
++            f = mix(f, f * f * (3.0f - 2.0f * f), 0.35f);
+             return mix(stops[index], stops[index + 1], f);
+         }
+ 
+@@ -565,8 +568,8 @@ enum NotchGlowShader {
+             float flow = angle + u.time / 14.0f
+                 + 0.07f * sin((angle * 3.0f - u.time / 7.0f) * 6.2831853f)
+                 + 0.04f * sin((angle * 5.0f + u.time / 11.0f) * 6.2831853f);
+-            float3 lineColor = rampColor(paletteStops, 7.0f, flow);
+-            float3 hazeColor = rampColor(paletteStops, 7.0f, flow + 0.10f * smoothstep(0.0f, 40.0f, glowDistance));
++            float3 lineColor = rampColor(paletteStops, 10.0f, flow);
++            float3 hazeColor = rampColor(paletteStops, 10.0f, flow + 0.16f * smoothstep(0.0f, 40.0f, glowDistance));
+             float3 silver = rampColor(silverStops, 6.0f, angle + u.time / 7.0f);
+             lineColor = mix(lineColor, silver, u.processing);
+             hazeColor = mix(hazeColor, silver, u.processing);
