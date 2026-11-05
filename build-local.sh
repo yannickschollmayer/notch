@@ -52,8 +52,23 @@ codesign --force --sign - --preserve-metadata=entitlements,flags,runtime \
 
 echo "→ In den Programme-Ordner legen"
 osascript -e 'tell application "VoiceInk" to quit' 2>/dev/null || true
+# Warten, bis die alte App wirklich beendet ist, sonst startet die neue nicht (Fehler -600).
+for _ in $(seq 1 20); do
+  pgrep -xq VoiceInk || break
+  sleep 0.5
+done
+pkill -x VoiceInk 2>/dev/null || true
+sleep 1
 rm -rf /Applications/VoiceInk.app
 ditto "$APP" /Applications/VoiceInk.app
 xattr -cr /Applications/VoiceInk.app
-open /Applications/VoiceInk.app
-echo "Fertig. VoiceInk Notch läuft."
+for _ in 1 2 3; do
+  open /Applications/VoiceInk.app && break
+  sleep 2
+done
+sleep 1
+if pgrep -xq VoiceInk; then
+  echo "Fertig. VoiceInk Notch läuft."
+else
+  echo "Fertig. Bitte VoiceInk einmal selbst aus dem Programme-Ordner öffnen."
+fi
