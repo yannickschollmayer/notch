@@ -1,0 +1,484 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift b/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
+index b42698a..bf49e64 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
+@@ -69,2 +69,4 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+     @Published private(set) var artwork: NSImage?
++    /// The cover's most vivid colours, strongest first, for the light around it.
++    @Published private(set) var artworkColors: [NSColor] = []
+     /// Length of the current track in seconds, when known.
+@@ -271,2 +273,3 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+         artwork = nil
++        artworkColors = []
+         artworkID = nil
+@@ -302,2 +305,3 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+         artwork = nil
++        artworkColors = []
+         let id = track.id
+@@ -311,2 +315,3 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+             guard let self, self.artworkID == id else { return }
++            self.artworkColors = image.map { Self.glowColors(of: $0) } ?? []
+             self.artwork = image
+@@ -315,2 +320,89 @@ final class NotchNowPlaying: NSObject, ObservableObject {
+ 
++    /// Up to three clearly different colours of the cover, made bright and vivid enough to glow.
++    /// White, grey and black parts don't count, so light covers glow in their colours instead of
++    /// a pale haze.
++    private static func glowColors(of image: NSImage) -> [NSColor] {
++        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
++              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return [] }
++        let side = 24
++        var pixels = [UInt8](repeating: 0, count: side * side * 4)
++        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
++            guard let context = CGContext(
++                data: buffer.baseAddress,
++                width: side,
++                height: side,
++                bitsPerComponent: 8,
++                bytesPerRow: side * 4,
++                space: space,
++                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
++            ) else { return false }
++            context.interpolationQuality = .medium
++            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: side, height: side))
++            return true
++        }
++        guard drawn else { return [] }
++
++        // Colourful pixels sorted by hue; vivid ones count more.
++        let bins = 12
++        var weights = [Double](repeating: 0, count: bins)
++        var sums = [(red: Double, green: Double, blue: Double)](repeating: (0, 0, 0), count: bins)
++        for index in stride(from: 0, to: pixels.count, by: 4) {
++            let red = Double(pixels[index]) / 255
++            let green = Double(pixels[index + 1]) / 255
++            let blue = Double(pixels[index + 2]) / 255
++            let high = max(red, green, blue)
++            let chroma = high - min(red, green, blue)
++            guard high > 0.15, chroma > 0.06, chroma / high > 0.12 else { continue }
++            var hue: Double
++            if high == red {
++                hue = (green - blue) / chroma
++            } else if high == green {
++                hue = (blue - red) / chroma + 2
++            } else {
++                hue = (red - green) / chroma + 4
++            }
++            hue = (hue / 6).truncatingRemainder(dividingBy: 1)
++            if hue < 0 { hue += 1 }
++            let bin = min(Int(hue * Double(bins)), bins - 1)
++            let weight = chroma * chroma
++            weights[bin] += weight
++            sums[bin].red += red * weight
++            sums[bin].green += green * weight
++            sums[bin].blue += blue * weight
++        }
++        guard let strongest = weights.max(), strongest > 0.15 else { return [] }
++
++        // The strongest hues that are not neighbours of one already chosen.
++        var chosen: [Int] = []
++        for bin in weights.indices.sorted(by: { weights[$0] > weights[$1] }) {
++            guard chosen.count < 3, weights[bin] >= strongest * 0.03 else { break }
++            let apart = chosen.allSatisfy { other in
++                let distance = abs(other - bin)
++                return min(distance, bins - distance) >= 2
++            }
++            if apart { chosen.append(bin) }
++        }
++
++        var colors = chosen.map { bin -> (hue: CGFloat, saturation: CGFloat, brightness: CGFloat) in
++            let weight = weights[bin]
++            let average = NSColor(
++                srgbRed: sums[bin].red / weight,
++                green: sums[bin].green / weight,
++                blue: sums[bin].blue / weight,
++                alpha: 1
++            )
++            var hue: CGFloat = 0
++            var saturation: CGFloat = 0
++            var brightness: CGFloat = 0
++            average.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: nil)
++            return (hue, min(1, max(saturation * 1.35, 0.5)), min(max(brightness, 0.82), 0.97))
++        }
++        // A cover in one colour still glows in a few shades of it.
++        if colors.count == 1, let only = colors.first {
++            colors.append(((only.hue + 0.07).truncatingRemainder(dividingBy: 1), only.saturation, only.brightness))
++            colors.append(((only.hue + 0.94).truncatingRemainder(dividingBy: 1), only.saturation * 0.7, min(1, only.brightness * 1.05)))
++        }
++        return colors.map { NSColor(hue: $0.hue, saturation: $0.saturation, brightness: $0.brightness, alpha: 1) }
++    }
++
+     nonisolated private static func fetchArtwork(from player: Player) async -> NSImage? {
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index d78ee53..a0e7cdd 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -516,2 +516,13 @@ enum NotchGlowShader {
+ 
++        // Depth into the lit area (a and b: depths below the two edges) whose lines keep running
++        // round through the corner between them, so no crease shows on the diagonal.
++        static float roundedDepth(float a, float b, float radius) {
++            float s = 0.5f * (a + b);
++            float t = 0.5f * (a - b);
++            if (abs(t) >= 0.5f * radius) {
++                return min(a, b);
++            }
++            return s + sqrt(0.5f * radius * radius - t * t) - radius;
++        }
++
+         static float3 rampColor(constant float3 *stops, float segments, float u) {
+@@ -574,3 +585,10 @@ enum NotchGlowShader {
+             float core = 1.0f - smoothstep(lineWidth, lineWidth + mix(1.0f, 2.0f, level), e);
+-            float bloom = mix(0.55f, 0.75f, level) * exp(-max(e - lineWidth, 0.0f) / mix(3.5f, 6.5f, level));
++            // Beyond the line the halo keeps the line's inner curve where it meets the island,
++            // evenly lit instead of folding into a corner.
++            float haloDepth = e;
++            if (dIsland < 9999.0f) {
++                float curve = max(top - lineWidth, 1.0f);
++                haloDepth = lineWidth + roundedDepth(-dScreen - lineWidth, dIsland - lineWidth, curve);
++            }
++            float bloom = mix(0.55f, 0.75f, level) * exp(-max(haloDepth - lineWidth, 0.0f) / mix(3.5f, 6.5f, level));
+             float shimmer = mix(0.26f, 0.38f, level) * exp(-pow(glowDistance / mix(16.0f, 28.0f, level), 1.5f));
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 5772c28..3c79236 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -15,2 +15,4 @@ enum NotchIslandStyle {
+     static let collapse = Animation.timingCurve(0.4, 0, 0.2, 1, duration: collapseDuration)
++    /// Top curve of the island while the screen glow runs into it.
++    static let glowJoinRadius: CGFloat = 14
+ 
+@@ -188,5 +190,11 @@ struct NotchIslandView: View {
+             return NotchIslandShape(topCornerRadius: 4, bottomCornerRadius: 8)
+-        case .hover, .menu, .recording, .processing, .music, .dropReady, .fileTask, .shelfPeek:
++        case .recording, .processing, .dropReady:
++            // Where the glowing line along the screen edge runs into the island: a wide curve, so
++            // the line stays round on both sides while it grows with the voice.
++            return NotchIslandShape(topCornerRadius: NotchIslandStyle.glowJoinRadius, bottomCornerRadius: 14)
++        case .liveText, .dropTarget:
++            return NotchIslandShape(topCornerRadius: NotchIslandStyle.glowJoinRadius, bottomCornerRadius: 22)
++        case .hover, .menu, .music, .fileTask, .shelfPeek:
+             return NotchIslandShape(topCornerRadius: 8, bottomCornerRadius: 14)
+-        case .liveText, .assistant, .dropTarget, .shelf:
++        case .assistant, .shelf:
+             return NotchIslandShape(topCornerRadius: 12, bottomCornerRadius: 22)
+@@ -362,6 +370,6 @@ struct NotchIslandView: View {
+             case .music:
+-                NotchMusicBars(isPlaying: model.music?.isPlaying == true)
++                NotchOrb(mode: .music(playing: model.music?.isPlaying == true), size: 16)
+             case .hover, .menu:
+                 if let music = model.music {
+-                    NotchMusicBars(isPlaying: music.isPlaying)
++                    NotchOrb(mode: .music(playing: music.isPlaying), size: 16)
+                 } else {
+@@ -384,12 +392,10 @@ struct NotchIslandView: View {
+             case .recording, .liveText:
+-                NotchIslandWaveform(
+-                    meter: { recorder.audioMeterSnapshot() },
+-                    isActive: model.recordingState == .recording,
+-                    maxHeight: max(8, min(18, rowHeight - 12))
+-                )
++                NotchOrb(mode: .voice, size: max(12, min(19, rowHeight - 16))) {
++                    model.recordingState == .recording ? recorder.audioMeterSnapshot().averagePower : 0
++                }
+             case .processing:
+-                NotchIslandProcessingDots()
++                NotchOrb(mode: .thinking, size: 16)
+             case .assistant:
+                 if assistantSession.isBusy || model.recordingState != .idle {
+-                    NotchIslandProcessingDots()
++                    NotchOrb(mode: .thinking, size: 16)
+                 } else {
+@@ -873,3 +879,3 @@ struct NotchPlayerPanel: View {
+                 VStack(alignment: .trailing, spacing: 9) {
+-                    NotchMusicBars(isPlaying: track.isPlaying)
++                    NotchOrb(mode: .music(playing: track.isPlaying), size: 17)
+                     if let icon = track.player.icon {
+@@ -914,4 +920,5 @@ struct NotchPlayerPanel: View {
+ 
+-    /// A light, soft glow in the cover's own colours, beside and below it. It never spreads up
+-    /// towards the top: light there would show the real notch through the island.
++    /// Light in the cover's own colours shining out from behind it in several directions: never
++    /// up towards the notch and only a little past the cover's right edge. Stronger while the song
++    /// plays.
+     @ViewBuilder
+@@ -919,11 +926,6 @@ struct NotchPlayerPanel: View {
+         if nowPlaying.artwork != nil {
+-            let reach: CGFloat = 40
++            let reach: CGFloat = 60
+             let side: CGFloat = 58 + reach * 2
+-            NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
+-                .scaleEffect(1.45)
+-                .blur(radius: 22)
+-                .saturation(1.5)
+-                .offset(x: -4, y: 4)
++            NotchCoverGlow(colors: glowColors, isPlaying: isPlaying)
+                 .frame(width: side, height: side)
+-                // Not up towards the notch, and only a little past the cover's right edge.
+                 .mask {
+@@ -948,3 +950,3 @@ struct NotchPlayerPanel: View {
+                 }
+-                .opacity(isPlaying ? 0.8 : 0.35)
++                .opacity(isPlaying ? 0.9 : 0.4)
+                 .animation(.easeInOut(duration: 0.6), value: isPlaying)
+@@ -954,2 +956,8 @@ struct NotchPlayerPanel: View {
+ 
++    /// The cover's vivid colours; a quiet silver when it has none (black, white or grey covers).
++    private var glowColors: [Color] {
++        let colors = nowPlaying.artworkColors.map { Color(nsColor: $0) }
++        return colors.isEmpty ? [NotchIslandStyle.silver.opacity(0.5)] : colors
++    }
++
+     private func controlButton(symbol: String, size: CGFloat, action: @escaping () -> Void) -> some View {
+@@ -1079,2 +1087,61 @@ struct NotchMusicArtwork: View {
+ 
++/// Soft beams of light in the given colours, running out from the centre in different directions
++/// and slowly swaying while the song plays (still while paused).
++struct NotchCoverGlow: View {
++    let colors: [Color]
++    let isPlaying: Bool
++
++    private struct Beam {
++        /// Degrees: 0 points right, 90 down.
++        let angle: Double
++        let length: CGFloat
++        let width: CGFloat
++        let color: Int
++    }
++
++    private static let beams: [Beam] = [
++        Beam(angle: 168, length: 92, width: 32, color: 0),
++        Beam(angle: 100, length: 84, width: 36, color: 0),
++        Beam(angle: 134, length: 104, width: 26, color: 1),
++        Beam(angle: 50, length: 70, width: 26, color: 2),
++        Beam(angle: 208, length: 72, width: 24, color: 1),
++        Beam(angle: 76, length: 60, width: 22, color: 2),
++    ]
++
++    var body: some View {
++        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isPlaying)) { context in
++            let time = context.date.timeIntervalSinceReferenceDate
++            ZStack {
++                ForEach(Self.beams.indices, id: \.self) { index in
++                    beam(Self.beams[index], index: index, time: time)
++                }
++            }
++            .blur(radius: 11)
++        }
++    }
++
++    private func beam(_ beam: Beam, index: Int, time: Double) -> some View {
++        let phase = Double(index) * 1.7
++        let angle = beam.angle + 9 * sin(time * 0.35 + phase)
++        let length = beam.length * (1 + 0.14 * sin(time * 0.6 + phase * 1.3))
++        let color = colors.isEmpty ? Color.clear : colors[beam.color % colors.count]
++        return Capsule()
++            .fill(
++                LinearGradient(
++                    stops: [
++                        .init(color: color, location: 0),
++                        .init(color: color.opacity(0.75), location: 0.45),
++                        .init(color: color.opacity(0), location: 1),
++                    ],
++                    startPoint: .leading,
++                    endPoint: .trailing
++                )
++            )
++            .frame(width: length, height: beam.width)
++            // Starts in the middle and runs outwards, turned around the middle.
++            .offset(x: length / 2)
++            .rotationEffect(.degrees(angle))
++    }
++}
++
+ /// A rounded rectangle whose corner radius is a share of its size.
+@@ -1099,26 +1166,116 @@ extension View {
+ 
+-/// Small gold bars that move while music plays.
+-struct NotchMusicBars: View {
+-    let isPlaying: Bool
+-
+-    private static let speeds: [Double] = [5.3, 7.1, 6.2, 8.3]
++/// A small glowing ball like the Siri orb of Apple Intelligence, in PromoPulse colours: the colours
++/// swirl inside it, and it swells with your voice while you dictate or pulses while music plays.
++struct NotchOrb: View {
++    enum Mode: Equatable {
++        /// Follows the voice.
++        case voice
++        /// Pulses gently while music plays (the app cannot hear the music itself).
++        case music(playing: Bool)
++        /// Transcribing or thinking: silvery, swirling faster.
++        case thinking
++    }
++
++    let mode: Mode
++    var size: CGFloat = 18
++    /// Voice level 0...1 (only used while dictating).
++    var level: () -> Double = { 0 }
++
++    @State private var smoother = NotchOrbSmoother()
++
++    private static let colors: [Color] = [
++        NotchIslandStyle.gold,
++        NotchIslandStyle.hex(0x8DB3FF),
++        NotchIslandStyle.hex(0x6A6CF2),
++        NotchIslandStyle.hex(0x3D6FE8),
++    ]
++    private static let silvers: [Color] = [
++        Color.white,
++        NotchIslandStyle.silver,
++        NotchIslandStyle.hex(0xB5BCC8),
++        NotchIslandStyle.hex(0x98A1B3),
++    ]
+ 
+     var body: some View {
+-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isPlaying)) { context in
++        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: mode == .music(playing: false))) { context in
+             let time = context.date.timeIntervalSinceReferenceDate
+-            HStack(alignment: .center, spacing: 2) {
+-                ForEach(0..<4, id: \.self) { index in
+-                    Capsule()
+-                        .fill(NotchIslandStyle.gold)
+-                        .frame(width: 2.5, height: barHeight(index: index, time: time))
+-                }
++            let energy = smoother.advance(to: target(at: time), at: time)
++            ball(time: time, energy: energy)
++        }
++        .frame(width: size, height: size)
++    }
++
++    private func target(at time: TimeInterval) -> Double {
++        switch mode {
++        case .voice:
++            return pow(max(0, min(1, level())), 0.7)
++        case .music(let playing):
++            guard playing else { return 0.12 }
++            // A soft beat around 114 per minute that breathes a little.
++            let beat = pow(0.5 + 0.5 * sin(time * 2 * .pi * 1.9), 3)
++            return 0.3 + 0.3 * beat * (0.75 + 0.25 * sin(time * 0.9))
++        case .thinking:
++            return 0.3 + 0.2 * (0.5 + 0.5 * sin(time * 2 * .pi / 1.2))
++        }
++    }
++
++    private func ball(time: TimeInterval, energy: Double) -> some View {
++        let thinking = mode == .thinking
++        let palette = thinking ? Self.silvers : Self.colors
++        let spin = time * (thinking ? 2.2 : 1.0)
++        let drift = size * CGFloat(0.15 + 0.12 * energy)
++
++        return ZStack {
++            Circle()
++                .fill(
++                    RadialGradient(
++                        colors: [NotchIslandStyle.hex(0x13213A), NotchIslandStyle.navy],
++                        center: .center,
++                        startRadius: 0,
++                        endRadius: size / 2
++                    )
++                )
++            ForEach(0..<palette.count, id: \.self) { index in
++                let angle = spin * (1 + Double(index) * 0.37) + Double(index) * 1.7
++                Circle()
++                    .fill(palette[index])
++                    .frame(width: size * 0.62, height: size * 0.62)
++                    .offset(x: CGFloat(cos(angle)) * drift, y: CGFloat(sin(angle * 1.3)) * drift)
++                    .blur(radius: size * 0.14)
++                    .blendMode(.plusLighter)
++                    .opacity(0.85)
+             }
+-            .frame(height: 14)
++            // A glassy highlight, like light on a sphere.
++            Circle()
++                .fill(
++                    RadialGradient(
++                        colors: [Color.white.opacity(0.55), Color.clear],
++                        center: UnitPoint(x: 0.34, y: 0.28),
++                        startRadius: 0,
++                        endRadius: size * 0.36
++                    )
++                )
+         }
++        .compositingGroup()
++        .clipShape(Circle())
++        .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
++        .scaleEffect(0.78 + 0.32 * energy)
++        .shadow(
++            color: (thinking ? NotchIslandStyle.silver : Self.colors[3]).opacity(0.35 + 0.45 * energy),
++            radius: 2 + 5 * energy
++        )
+     }
++}
+ 
+-    private func barHeight(index: Int, time: TimeInterval) -> CGFloat {
+-        guard isPlaying else { return 3 }
+-        let wave = (sin(time * Self.speeds[index] + Double(index) * 1.3) + 1) / 2
+-        return 4 + CGFloat(wave) * 10
++/// Smooths the orb's movement: quick to swell, a little slower to settle.
++final class NotchOrbSmoother {
++    private var value: Double = 0
++    private var lastTime: TimeInterval = 0
++
++    func advance(to target: Double, at time: TimeInterval) -> Double {
++        let delta = lastTime > 0 ? min(max(time - lastTime, 0), 0.1) : 1.0 / 60.0
++        lastTime = time
++        let rate = target > value ? 14.0 : 5.0
++        value += (target - value) * min(1, rate * delta)
++        return value
+     }
+@@ -1644,55 +1801 @@ struct NotchIslandGlow: View {
+ }
+-
+-// MARK: - Waveform
+-
+-struct NotchIslandWaveform: View {
+-    let meter: () -> AudioMeter
+-    let isActive: Bool
+-    let maxHeight: CGFloat
+-
+-    private let barCount = 5
+-    private let barWidth: CGFloat = 3
+-    private let minHeight: CGFloat = 3
+-
+-    var body: some View {
+-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+-            let level = isActive ? max(0, min(1, pow(meter().averagePower, 0.7))) : 0
+-            let time = context.date.timeIntervalSinceReferenceDate
+-
+-            HStack(spacing: 2.5) {
+-                ForEach(0..<barCount, id: \.self) { index in
+-                    Capsule()
+-                        .fill(NotchIslandStyle.gold)
+-                        .frame(width: barWidth, height: barHeight(index: index, level: level, time: time))
+-                }
+-            }
+-        }
+-    }
+-
+-    private func barHeight(index: Int, level: Double, time: TimeInterval) -> CGFloat {
+-        let wave = (sin(time * 9 + Double(index) * 0.9) + 1) / 2
+-        let middle = Double(barCount - 1) / 2
+-        let centerBoost = 1 - abs(Double(index) - middle) / Double(barCount) * 0.8
+-        let value = level * (0.35 + 0.65 * wave) * centerBoost
+-        return minHeight + CGFloat(value) * (maxHeight - minHeight)
+-    }
+-}
+-
+-// MARK: - Processing dots
+-
+-struct NotchIslandProcessingDots: View {
+-    var body: some View {
+-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+-            let time = context.date.timeIntervalSinceReferenceDate
+-            HStack(spacing: 3.5) {
+-                ForEach(0..<3, id: \.self) { index in
+-                    let phase = (sin(time * 6 - Double(index) * 0.8) + 1) / 2
+-                    Circle()
+-                        .fill(Color.white)
+-                        .frame(width: 4, height: 4)
+-                        .opacity(0.3 + 0.7 * phase)
+-                }
+-            }
+-        }
+-    }
+-}
