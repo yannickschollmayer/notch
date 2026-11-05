@@ -1,0 +1,5 @@
+run: 14
+commit: 2525be9af2748bbc6b57c0dd643402a5611bc2a7
+status: failure
+url: https://github.com/yannickschollmayer/notch/actions/runs/42058278428
+time: 2026-11-05T16:01:57Z

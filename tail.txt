@@ -1,0 +1,60 @@
+Applying 0001-wire-up-notch-tap-quotes-languages.patch
+Applying 0002-notch-island.patch
+Applying 0003-four-finger-tap.patch
+Applying 0004-notch-menu-screen-glow.patch
+Applying 0005-glass-menu-fast-glow-paste-hint.patch
+Applying 0006-soft-glow-clean-joint-no-paste-hint.patch
+Applying 0007-glow-outline-thicker-edge.patch
+Applying 0008-quote-titles.patch
+Applying 0009-synced-glow-music-file-drop.patch
+Applying 0010-soft-halo-round-corners-blue.patch
+Applying 0011-drop-targets-rainbow-glow.patch
+Applying 0012-blue-gold-glow.patch
+Applying 0013-music-player-island.patch
+Applying 0014-apple-feedback-shoulders-smileys.patch
+Applying 0015-notch-shelf-fillers-quotes.patch
+Applying 0016-hover-open-drag-glow-shadow.patch
+Applying 0017-near-wake-cover-glow-glass-de-en.patch
+Applying 0018-quick-collapse-cover-flight-ai-status.patch
+Applying 0019-soft-cover-glow.patch
+Applying 0020-orb-round-join-cover-beams.patch
+Applying 0021-centred-cover-halo.patch
+Applying 0022-music-level-with-strip.patch
+Applying 0023-short-ai-rules.patch
+ M VoiceInk/App/Configuration/AppDefaults.swift
+ M VoiceInk/App/VoiceInk.swift
+ M VoiceInk/Core/Enhancement/AIPrompts.swift
+ M VoiceInk/Features/ModelLibrary/Models/LanguageDictionary.swift
+ M VoiceInk/Features/ModelLibrary/Views/ModelSettingsPanel.swift
+ M VoiceInk/Features/Recording/Presentation/RecorderUIManager.swift
+ M VoiceInk/Features/Recording/Workflows/TranscriptionDelivery.swift
+ M VoiceInk/Features/Recording/Workflows/TranscriptionPipeline.swift
+ M VoiceInk/Features/Settings/Views/SettingsView.swift
+ M VoiceInk/Info.plist
+ M VoiceInk/InfoPlist.xcstrings
+?? VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+?? VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+?? VoiceInk/Features/Recording/Presentation/NotchNowPlaying.swift
+?? VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+?? VoiceInk/Features/Recording/Presentation/NotchShelf.swift
+?? VoiceInk/Features/Recording/Views/NotchIslandView.swift
+?? VoiceInk/Features/Shortcuts/Coordination/FourFingerTapMonitor.swift
+?? VoiceInk/NotchIsland.xcstrings
+Using /Applications/Xcode_26.6.0.app
+Xcode 26.6
+Build version 17F113
+Beginning asset download...
+Downloaded asset to: /System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain/5f4a441a6d0a11f2e9b28c67384263afe92320f7.asset/AssetData/Restore/022-21788-058.dmg
+Done downloading: Metal Toolchain 17F109.
+Info.plist
+ios-arm64
+ios-arm64_x86_64-simulator
+macos-arm64_x86_64
+tvos-arm64
+tvos-arm64_x86_64-simulator
+xros-arm64
+xros-arm64_x86_64-simulator
+Command line invocation:
+    /Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xcodebuild -resolvePackageDependencies -project VoiceInk.xcodeproj -scheme VoiceInk -derivedDataPath /Users/runner/work/notch/notch/dd -scmProvider system
+
+Resolve Package Graph
