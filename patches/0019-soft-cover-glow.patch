@@ -1,0 +1,61 @@
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 5f7fe92..5772c28 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -914,4 +914,4 @@ struct NotchPlayerPanel: View {
+ 
+-    /// The cover's own colours shining out behind it: a wide soft light and a closer, brighter one.
+-    /// Stronger while the song plays.
++    /// A light, soft glow in the cover's own colours, beside and below it. It never spreads up
++    /// towards the top: light there would show the real notch through the island.
+     @ViewBuilder
+@@ -919,17 +919,34 @@ struct NotchPlayerPanel: View {
+         if nowPlaying.artwork != nil {
+-            ZStack {
+-                NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
+-                    .scaleEffect(2.1)
+-                    .blur(radius: 30)
+-                    .opacity(0.6)
+-                NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
+-                    .scaleEffect(1.25)
+-                    .blur(radius: 12)
+-                    .opacity(0.8)
+-            }
+-            .saturation(1.6)
+-            .brightness(0.06)
+-            .opacity(isPlaying ? 1 : 0.45)
+-            .animation(.easeInOut(duration: 0.6), value: isPlaying)
+-            .allowsHitTesting(false)
++            let reach: CGFloat = 40
++            let side: CGFloat = 58 + reach * 2
++            NotchMusicArtwork(nowPlaying: nowPlaying, size: 58, cornerRadius: 12)
++                .scaleEffect(1.45)
++                .blur(radius: 22)
++                .saturation(1.5)
++                .offset(x: -4, y: 4)
++                .frame(width: side, height: side)
++                // Not up towards the notch, and only a little past the cover's right edge.
++                .mask {
++                    LinearGradient(
++                        stops: [
++                            .init(color: .clear, location: (reach - 4) / side),
++                            .init(color: .white, location: (reach + 14) / side),
++                        ],
++                        startPoint: .top,
++                        endPoint: .bottom
++                    )
++                }
++                .mask {
++                    LinearGradient(
++                        stops: [
++                            .init(color: .white, location: (reach + 58 + 4) / side),
++                            .init(color: .clear, location: (reach + 58 + 22) / side),
++                        ],
++                        startPoint: .leading,
++                        endPoint: .trailing
++                    )
++                }
++                .opacity(isPlaying ? 0.8 : 0.35)
++                .animation(.easeInOut(duration: 0.6), value: isPlaying)
++                .allowsHitTesting(false)
+         }
