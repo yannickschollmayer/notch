@@ -1,0 +1,22 @@
+diff --git a/VoiceInk/Core/Enhancement/AIPrompts.swift b/VoiceInk/Core/Enhancement/AIPrompts.swift
+index 332e1ba..3b73a58 100644
+--- a/VoiceInk/Core/Enhancement/AIPrompts.swift
++++ b/VoiceInk/Core/Enhancement/AIPrompts.swift
+@@ -17,6 +17,7 @@ enum AIPrompts {
+         - Do not add quotation marks to indirect or reported speech (for example “Er sagte, dass er später kommt”, “Sie meinte, sie komme später”, “He said he would be late”).
+         - Spoken quote markers such as “quote … end quote”, “quote … unquote”, “Zitat … Zitat Ende”, “Anführungszeichen … Anführungszeichen zu / Ende”, “entre guillemets … fin de citation”, “comillas … cierro comillas” or “cita … fin de la cita” mark the start and end of a quotation: remove the markers and put the enclosed words in quotation marks. If no end marker is spoken, end the quotation where the quoted sentence naturally ends.
+         - Put the names of on-screen elements the speaker refers to in quotation marks, written as they appear on screen with a capital first letter: buttons, menu items, tabs, links, settings, options, fields, and window, file, or channel titles. They typically follow verbs such as “click on”, “tap”, “select”, “choose”, “open”, “go to”, “klick auf”, “klicken auf”, “tippe auf”, “drück auf”, “wähle”, “öffne”, “geh auf”, “cliquez sur”, “sélectionnez”, “haz clic en”, “pulsa”, “selecciona”. Use <CURRENT_WINDOW_CONTEXT> to match the exact label when it is visible there. Do not quote ordinary objects that are not labels (for example “klick auf den Link”, “open the file”).
++        - Put titles in quotation marks: books, stories, poems, articles, songs, films, shows, podcasts, presentations, documents, assignments and texts being discussed, also when the title is in another language than the sentence. Keep the title’s own wording and capitalization.
+         - Use the quotation marks of the transcript’s language: German „…“ (nested ‚…‘), English “…” (nested ‘…’), French « … » with spaces inside, Spanish «…» (nested “…”). In German, introduce direct speech with a colon after the speech verb and capitalize its first word (Er sagte: „Ich komme morgen.“).
+         - Write clear spoken numbers as digits, except small numbers that read more naturally as words. Use standard forms for dates, times, currencies, percentages, measurements, phone numbers, email addresses, URLs, code, filenames, and file paths. Never guess unclear values.
+         - Use readable paragraphs. Start a new paragraph when the speaker moves to a new idea, question, topic, or tone. Keep paragraphs to no more than three sentences or about 40 words, whichever is shorter.
+@@ -72,6 +73,9 @@ enum AIPrompts {
+ 
+         Input: Click on save changes and then on publish
+         Output: Click on “Save changes” and then on “Publish”.
++
++        Input: Kurze Frage wenn ich die Language analysiere dann brauche ich doch eigentlich nur Tom writes short stories oder
++        Output: Kurze Frage: Wenn ich die Language analysiere, dann brauche ich doch eigentlich nur „Tom writes Short Stories“, oder?
+         </EXAMPLES>
+ 
+         <OUTPUT_REQUIREMENTS>
