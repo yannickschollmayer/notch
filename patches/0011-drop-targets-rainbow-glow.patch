@@ -1,0 +1,504 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift b/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+index 3a608b0..44bcde3 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+@@ -15,6 +15,14 @@ struct NotchFileDrag: Equatable {
+ 
+     var canTranscribe: Bool { urls.contains { SupportedMedia.isSupported(url: $0) } }
+     var canConvert: Bool { urls.contains { NotchFileActions.canConvertToMP3($0) } }
++
++    func allows(_ action: NotchDropAction) -> Bool {
++        switch action {
++        case .transcribe: return canTranscribe
++        case .mp3: return canConvert
++        case .airDrop: return !urls.isEmpty
++        }
++    }
+ }
+ 
+ /// Progress or result of a drop action, shown in a card below the notch.
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index 441af7d..581f23e 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -131,6 +131,8 @@ final class NotchIslandModel: ObservableObject {
+     @Published private(set) var music: NotchNowPlaying.Track?
+     /// Files being dragged across the screen right now.
+     @Published var fileDrag: NotchFileDrag?
++    /// The drop target the dragged file is over.
++    @Published var dropZone: NotchDropAction?
+     /// Card for a dropped file (working, done, failed).
+     @Published var fileTask: NotchFileTask?
+ 
+@@ -150,7 +152,9 @@ final class NotchIslandModel: ObservableObject {
+     static let rowBonus: CGFloat = 5
+     static let liveTextPanelHeight: CGFloat = 57
+     static let assistantPanelHeight: CGFloat = 320
+-    static let dropPanelHeight: CGFloat = 86
++    static let dropPanelHeight: CGFloat = 90
++    /// Side padding of the drop targets inside the island.
++    static let dropPanelInset: CGFloat = 14
+     /// Glass cards that drop down below the island.
+     static let menuCardSize = CGSize(width: 380, height: 150)
+     static let musicMenuCardSize = CGSize(width: 380, height: 222)
+@@ -363,6 +367,28 @@ final class NotchIslandModel: ObservableObject {
+         )
+     }
+ 
++    /// The drop target under a point on the screen. Anywhere over the expanded island counts, the
++    /// column decides which target.
++    func dropAction(at point: NSPoint) -> NotchDropAction? {
++        guard fileDrag != nil else { return nil }
++        let islandSize = self.size(for: .dropTarget)
++        let frame = geometry.screenFrame
++        let island = NSRect(
++            x: frame.midX - islandSize.width / 2,
++            y: frame.maxY - islandSize.height,
++            width: islandSize.width,
++            height: islandSize.height
++        )
++        guard island.insetBy(dx: -18, dy: -18).contains(point) else { return nil }
++        let inner = island.insetBy(dx: Self.dropPanelInset, dy: 0)
++        let column = Int(((point.x - inner.minX) / max(inner.width, 1) * 3).rounded(.down))
++        switch min(max(column, 0), 2) {
++        case 0: return .transcribe
++        case 1: return .mp3
++        default: return .airDrop
++        }
++    }
++
+     /// Whether the pointer counts as "on the island": the island, its card, and the gap between.
+     func containsPointer(_ point: NSPoint) -> Bool {
+         let island = islandRect()
+@@ -415,6 +441,76 @@ final class NotchIslandHostingView<Content: View>: NSHostingView<Content> {
+     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+ }
+ 
++/// Receives files dragged onto the island.
++@MainActor
++protocol NotchDropHandling: AnyObject {
++    func dragEntered(with urls: [URL])
++    /// Returns what a drop at this screen point would do (no operation: not possible here).
++    func dragMoved(to point: NSPoint) -> NSDragOperation
++    func dragLeft()
++    func dropFiles(_ urls: [URL], at point: NSPoint) -> Bool
++}
++
++/// Window content: hosts the SwiftUI island and takes part in drag and drop itself (plain AppKit,
++/// which works reliably in this non-activating panel).
++final class NotchIslandContainerView: NSView {
++    weak var dropHandler: NotchDropHandling?
++
++    override init(frame: NSRect) {
++        super.init(frame: frame)
++        wantsLayer = true
++        layer?.backgroundColor = NSColor.clear.cgColor
++        registerForDraggedTypes([.fileURL])
++    }
++
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
++        MainActor.assumeIsolated { () -> NSDragOperation in
++            dropHandler?.dragEntered(with: Self.fileURLs(in: sender.draggingPasteboard))
++            return operation(for: sender)
++        }
++    }
++
++    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
++        MainActor.assumeIsolated {
++            operation(for: sender)
++        }
++    }
++
++    override func draggingExited(_ sender: NSDraggingInfo?) {
++        MainActor.assumeIsolated {
++            guard let dropHandler else { return }
++            dropHandler.dragLeft()
++        }
++    }
++
++    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
++        true
++    }
++
++    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
++        MainActor.assumeIsolated { () -> Bool in
++            guard let window, let dropHandler else { return false }
++            let point = window.convertPoint(toScreen: sender.draggingLocation)
++            return dropHandler.dropFiles(Self.fileURLs(in: sender.draggingPasteboard), at: point)
++        }
++    }
++
++    private func operation(for sender: NSDraggingInfo) -> NSDragOperation {
++        guard let window, let dropHandler else { return [] }
++        return dropHandler.dragMoved(to: window.convertPoint(toScreen: sender.draggingLocation))
++    }
++
++    /// Finder hands out file reference URLs (/.file/id=…); these are turned into normal paths.
++    static func fileURLs(in pasteboard: NSPasteboard) -> [URL] {
++        let objects = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
++        return ((objects as? [NSURL]) ?? []).compactMap { $0.filePathURL }
++    }
++}
++
+ // MARK: - Controller
+ 
+ /// Owns the always-present notch window: invisible behind the hardware notch while idle,
+@@ -573,14 +669,21 @@ final class NotchIslandController {
+             onClose: onClose,
+             onAssistantFollowUp: onAssistantFollowUp,
+             onRetryLast: { [weak self] in self?.retryLastDictation() },
+-            onFileDrop: { [weak self] action in self?.handleDrop(action) },
+             onDismissFileTask: { [weak self] in self?.fileActions.dismiss() }
+         )
+         let hosting = NotchIslandHostingView(rootView: view)
+         hosting.sizingOptions = []
+         hosting.wantsLayer = true
+         hosting.layer?.backgroundColor = NSColor.clear.cgColor
+-        newPanel.contentView = hosting
++        // Dropped files go to the container, so the SwiftUI view must not take them first.
++        hosting.unregisterDraggedTypes()
++        hosting.autoresizingMask = [.width, .height]
++
++        let container = NotchIslandContainerView(frame: .zero)
++        container.dropHandler = self
++        hosting.frame = container.bounds
++        container.addSubview(hosting)
++        newPanel.contentView = container
+         panel = newPanel
+     }
+ 
+@@ -670,9 +773,7 @@ final class NotchIslandController {
+         guard count != dragChangeCount else { return }
+         dragChangeCount = count
+         guard model.fileDrag == nil, NSEvent.pressedMouseButtons & 1 == 1 else { return }
+-        let objects = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+-        // Finder hands out file reference URLs (/.file/id=…); turn them into normal paths.
+-        let urls = ((objects as? [NSURL]) ?? []).compactMap { $0.filePathURL }
++        let urls = NotchIslandContainerView.fileURLs(in: pasteboard)
+         guard !urls.isEmpty else { return }
+         beginFileDrag(urls)
+     }
+@@ -717,20 +818,15 @@ final class NotchIslandController {
+         dragTimer?.invalidate()
+         dragTimer = nil
+         dragReleasedAt = nil
++        if model.dropZone != nil {
++            model.dropZone = nil
++        }
+         if model.fileDrag != nil {
+             model.fileDrag = nil
+         }
+         updatePointerState()
+     }
+ 
+-    /// Files were dropped on one of the fields below the notch.
+-    private func handleDrop(_ action: NotchDropAction) {
+-        let urls = model.fileDrag?.urls ?? []
+-        endFileDrag()
+-        guard !urls.isEmpty else { return }
+-        fileActions.perform(action, on: urls)
+-    }
+-
+     private func removeEventMonitors() {
+         for monitor in eventMonitors {
+             NSEvent.removeMonitor(monitor)
+@@ -822,3 +918,47 @@ final class NotchIslandController {
+         )
+     }
+ }
++
++// MARK: - Drop on the island
++
++extension NotchIslandController: NotchDropHandling {
++    func dragEntered(with urls: [URL]) {
++        // Normally the drag was already noticed on its way here; if not, it starts now.
++        if model.fileDrag == nil, !urls.isEmpty {
++            beginFileDrag(urls)
++        }
++    }
++
++    func dragMoved(to point: NSPoint) -> NSDragOperation {
++        updatePointerState()
++        let zone = model.dropAction(at: point)
++        if zone != model.dropZone {
++            model.dropZone = zone
++            // A light click on the trackpad when the file reaches a target.
++            if let zone, model.fileDrag?.allows(zone) == true {
++                NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
++            }
++        }
++        guard let zone, model.fileDrag?.allows(zone) == true else { return [] }
++        return .copy
++    }
++
++    func dragLeft() {
++        if model.dropZone != nil {
++            model.dropZone = nil
++        }
++    }
++
++    func dropFiles(_ urls: [URL], at point: NSPoint) -> Bool {
++        let action = model.dropAction(at: point) ?? model.dropZone
++        let files = urls.isEmpty ? (model.fileDrag?.urls ?? []) : urls
++        guard let action, !files.isEmpty, NotchFileDrag(urls: files).allows(action) else {
++            endFileDrag()
++            return false
++        }
++        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
++        endFileDrag()
++        fileActions.perform(action, on: files)
++        return true
++    }
++}
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index 5d174cb..d3ca2a2 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -17,8 +17,9 @@ struct NotchGlowIsland: Equatable {
+ /// Every frame the shader works out how far each pixel is from the lit edge: the screen border and
+ /// the island's sides and bottom. The island outline is animated here with the same curve and
+ /// duration the island itself uses, so the line always grows and shrinks together with the island.
+-/// The voice makes the line clearly thicker and lets the glow reach further. Gold with a stretch
+-/// of PromoPulse blue that wanders around the screen.
++/// The voice makes the line clearly thicker and lets the glow reach further. The colours run all
++/// around the edge at once like Apple's light: PromoPulse gold, coral, violet, blue and a little
++/// white, drifting slowly.
+ @MainActor
+ final class NotchScreenGlowWindow {
+     enum Mode {
+@@ -44,7 +45,7 @@ final class NotchScreenGlowWindow {
+     private static let screenRadius: Float = 18
+     /// Bottom corners: the line runs round, close to the corner.
+     private static let bottomScreenRadius: Float = 10
+-    /// The colours repeat after this many seconds (7, 10, 11 and 1.75 s all fit into it).
++    /// The colours repeat after this many seconds (14, 7, 11 and 1.75 s all fit into it).
+     private static let colorPeriod: Double = 770
+ 
+     private var panel: NSPanel?
+@@ -460,16 +461,13 @@ enum NotchGlowShader {
+             float4 position [[position]];
+         };
+ 
+-        constant float3 goldStops[7] = {
+-            float3(1.000f, 0.761f, 0.102f), float3(0.969f, 0.643f, 0.000f), float3(1.000f, 0.824f, 0.247f),
+-            float3(0.941f, 0.549f, 0.000f), float3(0.992f, 0.792f, 0.247f), float3(1.000f, 0.690f, 0.000f),
+-            float3(1.000f, 0.761f, 0.102f)
++        // PromoPulse gold and its gradient, coral, PromoPulse violet and blue, a little white.
++        constant float3 paletteStops[8] = {
++            float3(0.992f, 0.792f, 0.247f), float3(1.000f, 0.851f, 0.471f), float3(0.988f, 0.639f, 0.067f),
++            float3(1.000f, 0.420f, 0.545f), float3(0.655f, 0.593f, 0.967f), float3(0.240f, 0.435f, 0.910f),
++            float3(0.860f, 0.900f, 1.000f), float3(0.992f, 0.792f, 0.247f)
+         };
+ 
+-        // PromoPulse navy (hue 222) as light: bright enough to glow on the screen edge.
+-        constant float3 promoBlue = float3(0.184f, 0.384f, 0.855f);
+-        constant float3 promoBlueDeep = float3(0.122f, 0.271f, 0.690f);
+-
+         constant float3 silverStops[7] = {
+             float3(1.000f, 1.000f, 1.000f), float3(0.851f, 0.867f, 0.894f), float3(0.710f, 0.737f, 0.784f),
+             float3(0.992f, 0.792f, 0.247f), float3(0.851f, 0.867f, 0.894f), float3(0.710f, 0.737f, 0.784f),
+@@ -496,9 +494,9 @@ enum NotchGlowShader {
+             return min(-radius, max(a, b)) + length(u);
+         }
+ 
+-        static float3 rampColor(constant float3 *stops, float u) {
+-            float x = fract(u) * 6.0f;
+-            int index = min(int(floor(x)), 5);
++        static float3 rampColor(constant float3 *stops, float segments, float u) {
++            float x = fract(u) * segments;
++            int index = min(int(floor(x)), int(segments) - 1);
+             float f = x - float(index);
+             f = f * f * (3.0f - 2.0f * f);
+             return mix(stops[index], stops[index + 1], f);
+@@ -559,24 +557,19 @@ enum NotchGlowShader {
+             float strength = mix(1.0f, 0.45f + 0.5f * pulse, u.processing);
+             strength *= clamp(u.opacity, 0.0f, 1.0f) * coverage;
+ 
+-            // Gold turning around the screen, with a stretch of PromoPulse blue wandering along it.
+-            // Between the two the light turns warm white instead of grey. The shimmer leans a
+-            // little further towards blue.
++            // All colours run around the edge at once and drift slowly; two gentle waves keep them
++            // from moving in lockstep, so they mix like Apple's light. Further in, the glow shows
++            // the next colours of the palette.
+             float2 fromCenter = p - center;
+             float angle = atan2(fromCenter.x, -fromCenter.y) / 6.2831853f;
+-            float3 gold = mix(
+-                rampColor(goldStops, angle + u.time / 7.0f),
+-                rampColor(goldStops, -angle + u.time / 10.0f),
+-                0.35f * level
+-            );
+-            float stretch = fract(angle + u.time / 11.0f);
+-            float blueWeight = smoothstep(0.0f, 0.10f, stretch) * (1.0f - smoothstep(0.18f, 0.30f, stretch));
+-            float3 lineColor = mix(gold, promoBlue, blueWeight);
+-            float brightest = max(max(lineColor.x, lineColor.y), lineColor.z);
+-            lineColor /= mix(1.0f, brightest, 3.4f * blueWeight * (1.0f - blueWeight));
+-            lineColor = mix(lineColor, rampColor(silverStops, angle + u.time / 7.0f), u.processing);
+-            float hazeBlue = 0.55f * smoothstep(4.0f, 30.0f, glowDistance) * (1.0f - u.processing);
+-            float3 hazeColor = mix(lineColor, promoBlueDeep, hazeBlue);
++            float flow = angle + u.time / 14.0f
++                + 0.07f * sin((angle * 3.0f - u.time / 7.0f) * 6.2831853f)
++                + 0.04f * sin((angle * 5.0f + u.time / 11.0f) * 6.2831853f);
++            float3 lineColor = rampColor(paletteStops, 7.0f, flow);
++            float3 hazeColor = rampColor(paletteStops, 7.0f, flow + 0.10f * smoothstep(0.0f, 40.0f, glowDistance));
++            float3 silver = rampColor(silverStops, 6.0f, angle + u.time / 7.0f);
++            lineColor = mix(lineColor, silver, u.processing);
++            hazeColor = mix(hazeColor, silver, u.processing);
+ 
+             float lit = core + (1.0f - core) * bloom;
+             float3 rgb = lit * lineColor + (1.0f - core) * (1.0f - bloom) * shimmer * hazeColor;
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index c137f9c..0df6bce 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -1,5 +1,4 @@
+ import SwiftUI
+-import UniformTypeIdentifiers
+ 
+ // MARK: - PromoPulse colours
+ 
+@@ -50,7 +49,6 @@ struct NotchIslandView: View {
+     let onClose: () -> Void
+     let onAssistantFollowUp: (String) -> Void
+     let onRetryLast: () -> Void
+-    let onFileDrop: (NotchDropAction) -> Void
+     let onDismissFileTask: () -> Void
+ 
+     @AppStorage(RecorderDisplaySettingsKeys.showLiveTranscript) private var showLiveTranscript = true
+@@ -118,8 +116,6 @@ struct NotchIslandView: View {
+                 meter: { recorder.audioMeterSnapshot() }
+             )
+         }
+-        // Lets the window take part in drags right away; the fields below do the actual work.
+-        .onDrop(of: [UTType.fileURL], isTargeted: nil) { _ in false }
+         .opacity(phase == .hidden ? 0 : 1)
+     }
+ 
+@@ -335,7 +331,9 @@ struct NotchIslandView: View {
+     @ViewBuilder
+     private func dropPanel(phase: NotchIslandPhase) -> some View {
+         if phase == .dropTarget {
+-            NotchDropZones(drag: model.fileDrag, onDrop: onFileDrop)
++            // The drop itself is handled by the window (NotchIslandContainerView), which also
++            // tells the model which field the file is over.
++            NotchDropZones(drag: model.fileDrag, hovered: model.dropZone)
+                 .frame(height: NotchIslandModel.dropPanelHeight)
+                 .transition(.opacity)
+         }
+@@ -713,71 +711,66 @@ struct NotchMusicBars: View {
+ 
+ // MARK: - File drop
+ 
+-/// The fields a dragged file can be dropped on: transcribe, convert to MP3, AirDrop.
++/// The targets a dragged file can be dropped on: transcribe, convert to MP3, AirDrop.
+ struct NotchDropZones: View {
+     let drag: NotchFileDrag?
+-    let onDrop: (NotchDropAction) -> Void
++    let hovered: NotchDropAction?
+ 
+     var body: some View {
+-        HStack(spacing: 8) {
+-            NotchDropZone(
+-                symbol: "text.bubble.fill",
+-                title: Text("Transcribe", tableName: "NotchIsland"),
+-                isEnabled: drag?.canTranscribe ?? false
+-            ) { onDrop(.transcribe) }
+-            NotchDropZone(
+-                symbol: "music.note",
+-                title: Text(verbatim: "MP3"),
+-                isEnabled: drag?.canConvert ?? false
+-            ) { onDrop(.mp3) }
+-            NotchDropZone(
+-                symbol: "dot.radiowaves.left.and.right",
+-                title: Text(verbatim: "AirDrop"),
+-                isEnabled: drag != nil
+-            ) { onDrop(.airDrop) }
++        HStack(spacing: 0) {
++            target(.transcribe, symbol: "text.bubble.fill", title: Text("Transcribe", tableName: "NotchIsland"))
++            target(.mp3, symbol: "music.note", title: Text(verbatim: "MP3"))
++            target(.airDrop, symbol: "dot.radiowaves.left.and.right", title: Text(verbatim: "AirDrop"))
+         }
+-        .padding(.horizontal, 12)
+-        .padding(.top, 4)
+-        .padding(.bottom, 12)
++        .padding(.horizontal, NotchIslandModel.dropPanelInset)
++        .frame(maxWidth: .infinity, maxHeight: .infinity)
++    }
++
++    private func target(_ action: NotchDropAction, symbol: String, title: Text) -> some View {
++        NotchDropTarget(
++            symbol: symbol,
++            title: title,
++            isEnabled: drag?.allows(action) ?? false,
++            isHovered: hovered == action,
++            isDimmed: hovered != nil && hovered != action
++        )
++        .frame(maxWidth: .infinity)
+     }
+ }
+ 
+-struct NotchDropZone: View {
++/// Round target in the expanded island: lights up gold and grows when the file is above it.
++struct NotchDropTarget: View {
+     let symbol: String
+     let title: Text
+     let isEnabled: Bool
+-    let action: () -> Void
+-
+-    @State private var isTargeted = false
++    let isHovered: Bool
++    let isDimmed: Bool
+ 
+     var body: some View {
+-        let active = isEnabled && isTargeted
+-        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
++        let active = isEnabled && isHovered
++
++        VStack(spacing: 7) {
++            ZStack {
++                Circle()
++                    .fill(active ? NotchIslandStyle.gold : Color.white.opacity(isEnabled ? 0.12 : 0.05))
++                Circle()
++                    .strokeBorder(Color.white.opacity(active ? 0 : (isEnabled ? 0.16 : 0.05)), lineWidth: 0.8)
++                Image(systemName: symbol)
++                    .font(.system(size: 17, weight: .semibold))
++                    .foregroundStyle(active ? NotchIslandStyle.navy : Color.white.opacity(isEnabled ? 0.92 : 0.25))
++            }
++            .frame(width: 44, height: 44)
++            .shadow(color: NotchIslandStyle.gold.opacity(active ? 0.6 : 0), radius: 9)
++            .scaleEffect(active ? 1.14 : 1)
+ 
+-        VStack(spacing: 6) {
+-            Image(systemName: symbol)
+-                .font(.system(size: 17, weight: .semibold))
+             title
+                 .font(.system(size: 11, weight: .semibold))
++                .foregroundStyle(active ? NotchIslandStyle.gold : Color.white.opacity(isEnabled ? 0.75 : 0.25))
+                 .lineLimit(1)
+         }
+-        .foregroundStyle(active ? NotchIslandStyle.navy : Color.white.opacity(isEnabled ? 0.9 : 0.3))
+-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+-        .background(shape.fill(active ? NotchIslandStyle.gold : Color.white.opacity(isEnabled ? 0.08 : 0.03)))
+-        .overlay(
+-            shape.strokeBorder(
+-                NotchIslandStyle.gold.opacity(isEnabled && !active ? 0.4 : 0),
+-                style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+-            )
+-        )
+-        .scaleEffect(active ? 1.04 : 1)
+-        .animation(.easeOut(duration: 0.15), value: active)
+-        .contentShape(shape)
+-        .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted) { _ in
+-            guard isEnabled else { return false }
+-            action()
+-            return true
+-        }
++        .opacity(isDimmed && !active ? 0.5 : 1)
++        .animation(.spring(response: 0.28, dampingFraction: 0.68), value: active)
++        .animation(.easeOut(duration: 0.15), value: isDimmed)
+     }
+ }
+ 
