@@ -1,0 +1,1492 @@
+diff --git a/VoiceInk/Core/Enhancement/AIPrompts.swift b/VoiceInk/Core/Enhancement/AIPrompts.swift
+index aa8ed94..d0c8991 100644
+--- a/VoiceInk/Core/Enhancement/AIPrompts.swift
++++ b/VoiceInk/Core/Enhancement/AIPrompts.swift
+@@ -12,4 +12,5 @@ enum AIPrompts {
+         - Correct only what is necessary for accurate, readable transcription: obvious ASR, spelling, grammar, capitalization, punctuation, and sentence-boundary errors. Never add unspoken information or remove meaningful information. When uncertain, preserve the original wording.
+-        - Remove stutters, accidental repetition, and abandoned false starts.
+-        - For clear self-corrections, remove the rejected wording and correction signal, keeping only the final intended wording. Correction signals may include “wait”, “wait no”, “actually”, “sorry”, “scratch that”, “I mean”, “no”, and similar expressions. Preserve these expressions when they carry independent meaning or emphasis.
++        - Remove stutters, accidental repetition, abandoned false starts, and hesitation sounds (“äh”, “ähm”, “öhm”, “hm”, “uh”, “um”, “er”, “euh”, “eh”) that only fill a pause while the speaker thinks.
++        - Keep such a sound only when the speaker talks about the word itself (for example “ich will keine Ähms im Text”); then it is a mentioned word and goes in quotation marks like any other mentioned word.
++        - For clear self-corrections, remove the rejected wording and correction signal, keeping only the final intended wording. Correction signals may include “wait”, “wait no”, “actually”, “sorry”, “scratch that”, “I mean”, “no”, “warte”, “nein”, “nee”, “Quatsch”, “sorry”, “ich meine”, “ich meinte”, “also eigentlich”, “beziehungsweise” (when it replaces what was just said), and similar expressions, also after the corrected word (“überliege, überlege, meine ich” → “überlege”). A slip of the tongue that is corrected right away keeps only the corrected word. Preserve these expressions when they carry independent meaning or emphasis.
+         - Apply spoken formatting cues such as “comma”, “period”, “question mark”, “new line”, and “new paragraph” where they are dictated, in any language (for example “Komma”, “Punkt”, “Fragezeichen”, “neue Zeile”, “neuer Absatz”; “virgule”, “point”, “à la ligne”; “coma”, “punto”, “nueva línea”).
+@@ -19,2 +20,3 @@ enum AIPrompts {
+         - Put the names of on-screen elements the speaker refers to in quotation marks, written as they appear on screen with a capital first letter: buttons, menu items, tabs, links, settings, options, fields, and window, file, or channel titles. They typically follow verbs such as “click on”, “tap”, “select”, “choose”, “open”, “go to”, “klick auf”, “klicken auf”, “tippe auf”, “drück auf”, “wähle”, “öffne”, “geh auf”, “cliquez sur”, “sélectionnez”, “haz clic en”, “pulsa”, “selecciona”. Use <CURRENT_WINDOW_CONTEXT> to match the exact label when it is visible there. Do not quote ordinary objects that are not labels (for example “klick auf den Link”, “open the file”).
++        - Put words and phrases the speaker talks about as words in quotation marks: terms being defined, explained, spelled, translated, or discussed (“das Wort Ähm”, “wenn ich überlege sage”, “the word um”, “schreib lieber Danke statt Vielen Dank”), and labels or names of options the speaker refers to (“die MP3-Option”, “der Ablegen-Knopf”, written with the quoted label only: die „MP3“-Option).
+         - Put titles in quotation marks: books, stories, poems, articles, songs, films, shows, podcasts, presentations, documents, assignments and texts being discussed, also when the title is in another language than the sentence. Keep the title’s own wording and capitalization.
+@@ -92,2 +94,14 @@ enum AIPrompts {
+         Output: Passt perfekt 👍
++
++        Input: Ähm ich wollte fragen ob du äh morgen Zeit hast
++        Output: Ich wollte fragen, ob du morgen Zeit hast.
++
++        Input: Die Transkription soll keine ähms mehr mit reinnehmen
++        Output: Die Transkription soll keine „Ähms“ mehr mit reinnehmen.
++
++        Input: Wenn ich überliege äh ich meinte überlege dann soll das weg
++        Output: Wenn ich überlege, dann soll das weg.
++
++        Input: Und die KI soll so funktionieren beziehungsweise die Transkription dass das klappt
++        Output: Und die Transkription soll so funktionieren, dass das klappt.
+         </EXAMPLES>
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift b/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+index 44bcde3..6f9ddaf 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+@@ -1,3 +1,2 @@
+ import AppKit
+-import UniformTypeIdentifiers
+ import os
+@@ -6,4 +5,4 @@ import os
+ enum NotchDropAction {
+-    case transcribe
+-    case mp3
++    /// Park the files on the notch, to drag them out again into any app later.
++    case shelf
+     case airDrop
+@@ -14,12 +13,9 @@ struct NotchFileDrag: Equatable {
+     let urls: [URL]
++    /// Files that are only promised and written on drop (WhatsApp, Mail, Photos …).
++    var hasPromises = false
+ 
+-    var canTranscribe: Bool { urls.contains { SupportedMedia.isSupported(url: $0) } }
+-    var canConvert: Bool { urls.contains { NotchFileActions.canConvertToMP3($0) } }
++    var isEmpty: Bool { urls.isEmpty && !hasPromises }
+ 
+     func allows(_ action: NotchDropAction) -> Bool {
+-        switch action {
+-        case .transcribe: return canTranscribe
+-        case .mp3: return canConvert
+-        case .airDrop: return !urls.isEmpty
+-        }
++        !isEmpty
+     }
+@@ -27,31 +23,12 @@ struct NotchFileDrag: Equatable {
+ 
+-/// Progress or result of a drop action, shown in a card below the notch.
++/// A drop that did not work, shown in a card below the notch.
+ struct NotchFileTask: Equatable {
+-    enum Kind: Equatable {
+-        case transcribe
+-        case mp3
+-    }
+-
+-    enum State: Equatable {
+-        case working
+-        case transcript(String)
+-        case saved(URL)
+-        case failed(String)
+-    }
+-
+     let id = UUID()
+-    let kind: Kind
+     let fileName: String
+-    var state: State
+-
+-    var isFinished: Bool {
+-        if case .working = state { return false }
+-        return true
+-    }
++    let message: String
+ }
+ 
+-/// Transcribe, convert to MP3 (like VideoLoader) or AirDrop the files dropped on the notch.
++/// Parks dropped files on the notch or sends them via AirDrop.
+ @MainActor
+ final class NotchFileActions {
+-    private weak var engine: VoiceInkEngine?
+     private let model: NotchIslandModel
+@@ -60,4 +37,3 @@ final class NotchFileActions {
+ 
+-    init(engine: VoiceInkEngine, model: NotchIslandModel) {
+-        self.engine = engine
++    init(model: NotchIslandModel) {
+         self.model = model
+@@ -65,12 +41,18 @@ final class NotchFileActions {
+ 
+-    func perform(_ action: NotchDropAction, on urls: [URL]) {
++    /// Called while the drop is still going on: promised files must be asked for right away.
++    func perform(_ action: NotchDropAction, urls: [URL], promises: [NSFilePromiseReceiver]) {
+         let files = urls.filter(\.isFileURL)
+-        guard !files.isEmpty else { return }
++        guard !files.isEmpty || !promises.isEmpty else { return }
+         switch action {
+-        case .transcribe:
+-            transcribe(files.filter { SupportedMedia.isSupported(url: $0) })
+-        case .mp3:
+-            convert(files.filter { Self.canConvertToMP3($0) })
++        case .shelf:
++            model.shelf.add(files)
++            model.shelf.receive(promises)
+         case .airDrop:
+-            airDrop(files)
++            if files.isEmpty {
++                NotchPromisedFiles.receiveAll(promises) { [weak self] received in
++                    self?.airDrop(received)
++                }
++            } else {
++                airDrop(files)
++            }
+         }
+@@ -84,193 +66,2 @@ final class NotchFileActions {
+ 
+-    /// Videos, and audio that is not an MP3 yet.
+-    nonisolated static func canConvertToMP3(_ url: URL) -> Bool {
+-        let fileExtension = url.pathExtension.lowercased()
+-        guard fileExtension != "mp3" else { return false }
+-        guard let type = UTType(filenameExtension: fileExtension) else {
+-            return SupportedMedia.isSupported(url: url)
+-        }
+-        return type.conforms(to: .movie) || type.conforms(to: .audio)
+-    }
+-
+-    // MARK: Transcribe
+-
+-    private func transcribe(_ files: [URL]) {
+-        guard !files.isEmpty, let engine else { return }
+-        var task = NotchFileTask(kind: .transcribe, fileName: Self.name(of: files), state: .working)
+-
+-        guard let mode = ModeManager.shared.currentEffectiveConfiguration else {
+-            task.state = .failed(String(localized: "Choose a mode in VoiceInk first.", table: "NotchIsland"))
+-            show(task)
+-            return
+-        }
+-
+-        let manager = AudioTranscriptionManager.shared
+-        let known = Set(manager.queue.map(\.id))
+-        manager.addToQueue(urls: files)
+-        let items = manager.queue.filter { !known.contains($0.id) }
+-        guard !items.isEmpty else {
+-            task.state = .failed(String(localized: "These files are already being transcribed.", table: "NotchIsland"))
+-            show(task)
+-            return
+-        }
+-
+-        show(task)
+-        manager.startProcessing(modelContext: engine.modelContext, engine: engine, mode: mode)
+-
+-        let started = task
+-        Task { @MainActor [weak self] in
+-            var result = started
+-            // Same queue as "Transcribe Audio" in VoiceInk, so the results also land in the history.
+-            var idleChecks = 0
+-            while items.contains(where: { !$0.status.isTerminal }) {
+-                try? await Task.sleep(nanoseconds: 300_000_000)
+-                // Stopped from elsewhere (e.g. cancelled in the main window).
+-                if !manager.isProcessingQueue {
+-                    idleChecks += 1
+-                    if idleChecks > 6 { break }
+-                } else {
+-                    idleChecks = 0
+-                }
+-            }
+-
+-            var texts: [String] = []
+-            var failure: String?
+-            for item in items {
+-                switch item.status {
+-                case .completed:
+-                    if let transcription = item.transcription {
+-                        texts.append(Self.text(of: transcription))
+-                    }
+-                case .failed(let message):
+-                    failure = message
+-                case .pending, .processing:
+-                    failure = String(localized: "Canceled", table: "NotchIsland")
+-                }
+-            }
+-
+-            guard let self else { return }
+-            let text = texts.joined(separator: "\n\n")
+-            if !text.isEmpty {
+-                _ = ClipboardManager.copyToClipboard(text)
+-                result.state = .transcript(text)
+-            } else {
+-                result.state = .failed(failure ?? String(localized: "Nothing was recognized.", table: "NotchIsland"))
+-            }
+-            self.show(result)
+-        }
+-    }
+-
+-    /// The AI-cleaned text when that worked, the plain transcript otherwise.
+-    private static func text(of transcription: Transcription) -> String {
+-        if let enhanced = transcription.enhancedText, !enhanced.isEmpty, transcription.enhancementDuration != nil {
+-            return enhanced
+-        }
+-        return transcription.text
+-    }
+-
+-    // MARK: MP3
+-
+-    private func convert(_ files: [URL]) {
+-        guard !files.isEmpty else { return }
+-        var task = NotchFileTask(kind: .mp3, fileName: Self.name(of: files), state: .working)
+-        guard let ffmpeg = Self.ffmpegURL() else {
+-            task.state = .failed(
+-                String(localized: "ffmpeg was not found. Open VideoLoader once, or install ffmpeg with Homebrew.", table: "NotchIsland")
+-            )
+-            show(task)
+-            return
+-        }
+-        show(task)
+-
+-        let started = task
+-        Task { @MainActor [weak self] in
+-            var result = started
+-            var saved: [URL] = []
+-            var failed = false
+-            for file in files {
+-                if let output = await Self.convertToMP3(file, ffmpeg: ffmpeg) {
+-                    saved.append(output)
+-                } else {
+-                    failed = true
+-                }
+-            }
+-
+-            guard let self else { return }
+-            if let last = saved.last {
+-                result.state = .saved(last)
+-            } else {
+-                result.state = .failed(String(localized: "The file could not be converted.", table: "NotchIsland"))
+-            }
+-            if failed {
+-                self.logger.error("Notch MP3: \(files.count - saved.count, privacy: .public) file(s) failed")
+-            }
+-            self.show(result)
+-        }
+-    }
+-
+-    /// The ffmpeg VideoLoader brings along, or one installed with Homebrew.
+-    nonisolated private static func ffmpegURL() -> URL? {
+-        let home = FileManager.default.homeDirectoryForCurrentUser
+-        let candidates = [
+-            home.appendingPathComponent("Library/Application Support/VideoLoader/bin/ffmpeg"),
+-            URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
+-            URL(fileURLWithPath: "/usr/local/bin/ffmpeg"),
+-        ]
+-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+-    }
+-
+-    /// Same folder VideoLoader saves to.
+-    nonisolated private static func outputFolder() -> URL {
+-        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
+-        return downloads.appendingPathComponent("VideoLoader", isDirectory: true)
+-    }
+-
+-    nonisolated private static func convertToMP3(_ input: URL, ffmpeg: URL) async -> URL? {
+-        let folder = outputFolder()
+-        do {
+-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+-        } catch {
+-            return nil
+-        }
+-        let base = input.deletingPathExtension().lastPathComponent
+-        var output = folder.appendingPathComponent(base + ".mp3")
+-        var counter = 2
+-        while FileManager.default.fileExists(atPath: output.path) {
+-            output = folder.appendingPathComponent(base + " " + String(counter) + ".mp3")
+-            counter += 1
+-        }
+-        let target = output
+-
+-        let succeeded: Bool = await withCheckedContinuation { continuation in
+-            let process = Process()
+-            process.executableURL = ffmpeg
+-            process.arguments = [
+-                "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+-                "-i", input.path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", target.path,
+-            ]
+-            process.standardInput = FileHandle.nullDevice
+-            process.standardOutput = FileHandle.nullDevice
+-            process.standardError = FileHandle.nullDevice
+-            process.terminationHandler = { finished in
+-                let ok = finished.terminationStatus == 0
+-                // The handler keeps the process alive until it ends; then let both go.
+-                finished.terminationHandler = nil
+-                withExtendedLifetime(process) {}
+-                continuation.resume(returning: ok)
+-            }
+-            do {
+-                try process.run()
+-            } catch {
+-                continuation.resume(returning: false)
+-            }
+-        }
+-
+-        if !succeeded {
+-            try? FileManager.default.removeItem(at: target)
+-            return nil
+-        }
+-        return target
+-    }
+-
+     // MARK: AirDrop
+@@ -281,6 +72,14 @@ final class NotchFileActions {
+             try? await Task.sleep(nanoseconds: 200_000_000)
+-            guard let service = NSSharingService(named: .sendViaAirDrop), service.canPerform(withItems: files) else {
+-                var task = NotchFileTask(kind: .mp3, fileName: Self.name(of: files), state: .working)
+-                task.state = .failed(String(localized: "AirDrop is not available.", table: "NotchIsland"))
+-                self?.show(task)
++            guard let self else { return }
++            guard !files.isEmpty,
++                let service = NSSharingService(named: .sendViaAirDrop),
++                service.canPerform(withItems: files)
++            else {
++                self.logger.error("Notch AirDrop: not available for \(files.count, privacy: .public) file(s)")
++                self.show(
++                    NotchFileTask(
++                        fileName: Self.name(of: files),
++                        message: String(localized: "AirDrop is not available.", table: "NotchIsland")
++                    )
++                )
+                 return
+@@ -297,4 +96,2 @@ final class NotchFileActions {
+         autoDismiss?.cancel()
+-        autoDismiss = nil
+-        guard task.isFinished else { return }
+ 
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index d7d5cb0..e1dc892 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -90,4 +90,8 @@ enum NotchIslandPhase: Equatable {
+     case dropTarget
+-    /// Progress or result of a dropped file, in a card below.
++    /// A drop that did not work, in a card below.
+     case fileTask
++    /// Pointer on the notch while files are parked on it: the files, ready to be dragged out.
++    case shelf
++    /// Files are parked on the notch: a small preview beside it.
++    case shelfPeek
+ 
+@@ -96,3 +100,4 @@ enum NotchIslandPhase: Equatable {
+         case .recording, .processing, .liveText, .assistant: return true
+-        case .hidden, .idle, .hover, .menu, .player, .music, .dropReady, .dropTarget, .fileTask: return false
++        case .hidden, .idle, .hover, .menu, .player, .music, .dropReady, .dropTarget, .fileTask, .shelf, .shelfPeek:
++            return false
+         }
+@@ -104,3 +109,4 @@ enum NotchIslandPhase: Equatable {
+         case .recording, .liveText, .processing: return true
+-        case .hidden, .idle, .hover, .menu, .player, .assistant, .music, .dropReady, .dropTarget, .fileTask:
++        case .hidden, .idle, .hover, .menu, .player, .assistant, .music, .dropReady, .dropTarget, .fileTask, .shelf,
++            .shelfPeek:
+             return false
+@@ -118,4 +124,5 @@ enum NotchIslandPhase: Equatable {
+         switch self {
+-        case .player, .dropTarget, .assistant: return true
+-        case .hidden, .idle, .hover, .menu, .recording, .processing, .liveText, .music, .dropReady, .fileTask:
++        case .player, .dropTarget, .assistant, .shelf: return true
++        case .hidden, .idle, .hover, .menu, .recording, .processing, .liveText, .music, .dropReady, .fileTask,
++            .shelfPeek:
+             return false
+@@ -151,4 +158,8 @@ final class NotchIslandModel: ObservableObject {
+     @Published var dropZone: NotchDropAction?
+-    /// Card for a dropped file (working, done, failed).
++    /// Card for a drop that did not work.
+     @Published var fileTask: NotchFileTask?
++    /// Files parked on the notch.
++    let shelf: NotchShelf
++    @Published private(set) var shelfItems: [NotchShelf.Item] = []
++    @Published private(set) var shelfDraggingOut = false
+ 
+@@ -169,3 +180,3 @@ final class NotchIslandModel: ObservableObject {
+     static let playerWidth: CGFloat = 372
+-    static let dropTargetWidth: CGFloat = 372
++    static let dropTargetWidth: CGFloat = 300
+     static let rowBonus: CGFloat = 5
+@@ -174,2 +185,4 @@ final class NotchIslandModel: ObservableObject {
+     static let dropPanelHeight: CGFloat = 84
++    static let shelfPanelHeight: CGFloat = 84
++    static let shelfTileWidth: CGFloat = 72
+     static let playerPanelHeight: CGFloat = 156
+@@ -193,2 +206,3 @@ final class NotchIslandModel: ObservableObject {
+         self.nowPlaying = NotchNowPlaying()
++        self.shelf = NotchShelf()
+ 
+@@ -233,2 +247,12 @@ final class NotchIslandModel: ObservableObject {
+ 
++        shelf.$items
++            .removeDuplicates()
++            .sink { [weak self] items in self?.shelfItems = items }
++            .store(in: &cancellables)
++
++        shelf.$isDraggingOut
++            .removeDuplicates()
++            .sink { [weak self] dragging in self?.shelfDraggingOut = dragging }
++            .store(in: &cancellables)
++
+         NotificationCenter.default.publisher(for: .transcriptionCompleted)
+@@ -298,4 +322,7 @@ final class NotchIslandModel: ObservableObject {
+         if fileTask != nil { return .fileTask }
+-        if isHovering { return .hover }
++        // Stays open while a parked file is dragged out of it.
++        if shelfDraggingOut { return .shelf }
++        if isHovering { return shelfItems.isEmpty ? .hover : .shelf }
+         if music?.isPlaying == true { return .music }
++        if !shelfItems.isEmpty { return .shelfPeek }
+         return geometry.hasNotch ? .idle : .hidden
+@@ -303,2 +330,9 @@ final class NotchIslandModel: ObservableObject {
+ 
++    /// Just wide enough for the parked files (up to four side by side, more scroll).
++    private var shelfWidth: CGFloat {
++        let count = CGFloat(min(max(shelfItems.count, 1), 4))
++        let tiles = count * Self.shelfTileWidth + (count - 1) * Self.dropTileSpacing
++        return min(Self.playerWidth, max(geometry.notchWidth + 100, tiles + Self.dropPanelInset * 2))
++    }
++
+     var rowHeight: CGFloat {
+@@ -331,4 +365,6 @@ final class NotchIslandModel: ObservableObject {
+             return CGSize(width: width + Self.assistantWing * 2, height: row + Self.assistantPanelHeight)
+-        case .music:
++        case .music, .shelfPeek:
+             return CGSize(width: width + Self.musicWing * 2, height: row)
++        case .shelf:
++            return CGSize(width: shelfWidth, height: row + Self.shelfPanelHeight)
+         case .dropReady:
+@@ -418,9 +454,4 @@ final class NotchIslandModel: ObservableObject {
+         guard island.insetBy(dx: -18, dy: -18).contains(point) else { return nil }
+-        let inner = island.insetBy(dx: Self.dropPanelInset, dy: 0)
+-        let column = Int(((point.x - inner.minX) / max(inner.width, 1) * 3).rounded(.down))
+-        switch min(max(column, 0), 2) {
+-        case 0: return .transcribe
+-        case 1: return .mp3
+-        default: return .airDrop
+-        }
++        // Left half: park on the notch, right half: AirDrop.
++        return point.x < island.midX ? .shelf : .airDrop
+     }
+@@ -482,3 +513,3 @@ final class NotchIslandHostingView<Content: View>: NSHostingView<Content> {
+ protocol NotchDropHandling: AnyObject {
+-    func dragEntered(with urls: [URL])
++    func dragEntered(with urls: [URL], hasPromises: Bool)
+     /// Returns what a drop at this screen point would do (no operation: not possible here).
+@@ -486,3 +517,3 @@ protocol NotchDropHandling: AnyObject {
+     func dragLeft()
+-    func dropFiles(_ urls: [URL], at point: NSPoint) -> Bool
++    func dropFiles(_ urls: [URL], promises: [NSFilePromiseReceiver], at point: NSPoint) -> Bool
+ }
+@@ -498,3 +529,5 @@ final class NotchIslandContainerView: NSView {
+         layer?.backgroundColor = NSColor.clear.cgColor
+-        registerForDraggedTypes([.fileURL])
++        // Files, and files that apps like WhatsApp or Mail only promise and write on drop.
++        let promised = NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) }
++        registerForDraggedTypes([.fileURL] + promised)
+     }
+@@ -507,3 +540,4 @@ final class NotchIslandContainerView: NSView {
+         MainActor.assumeIsolated { () -> NSDragOperation in
+-            dropHandler?.dragEntered(with: Self.fileURLs(in: sender.draggingPasteboard))
++            let pasteboard = sender.draggingPasteboard
++            dropHandler?.dragEntered(with: Self.fileURLs(in: pasteboard), hasPromises: Self.hasFilePromises(in: pasteboard))
+             return operation(for: sender)
+@@ -533,3 +567,6 @@ final class NotchIslandContainerView: NSView {
+             let point = window.convertPoint(toScreen: sender.draggingLocation)
+-            return dropHandler.dropFiles(Self.fileURLs(in: sender.draggingPasteboard), at: point)
++            let pasteboard = sender.draggingPasteboard
++            let urls = Self.fileURLs(in: pasteboard)
++            let promises = urls.isEmpty ? Self.filePromises(in: pasteboard) : []
++            return dropHandler.dropFiles(urls, promises: promises, at: point)
+         }
+@@ -547,2 +584,11 @@ final class NotchIslandContainerView: NSView {
+     }
++
++    static func hasFilePromises(in pasteboard: NSPasteboard) -> Bool {
++        let promised = Set(NSFilePromiseReceiver.readableDraggedTypes)
++        return pasteboard.types?.contains { promised.contains($0.rawValue) } ?? false
++    }
++
++    static func filePromises(in pasteboard: NSPasteboard) -> [NSFilePromiseReceiver] {
++        (pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver]) ?? []
++    }
+ }
+@@ -588,3 +634,3 @@ final class NotchIslandController {
+         self.model = model
+-        self.fileActions = NotchFileActions(engine: engine, model: model)
++        self.fileActions = NotchFileActions(model: model)
+         self.engine = engine
+@@ -785,4 +831,4 @@ final class NotchIslandController {
+         guard !model.containsPointer(NSEvent.mouseLocation) else { return }
+-        // A finished file card goes away with a click elsewhere.
+-        if let task = model.fileTask, task.isFinished, !model.menuOpen {
++        // The file card goes away with a click elsewhere.
++        if model.fileTask != nil, !model.menuOpen {
+             fileActions.dismiss()
+@@ -812,7 +858,12 @@ final class NotchIslandController {
+         let urls = NotchIslandContainerView.fileURLs(in: pasteboard)
+-        guard !urls.isEmpty else { return }
+-        beginFileDrag(urls)
++        let hasPromises = urls.isEmpty && NotchIslandContainerView.hasFilePromises(in: pasteboard)
++        beginFileDrag(urls, hasPromises: hasPromises)
+     }
+ 
+-    private func beginFileDrag(_ urls: [URL]) {
++    private func beginFileDrag(_ urls: [URL], hasPromises: Bool) {
++        let drag = NotchFileDrag(urls: urls, hasPromises: hasPromises)
++        // Nothing to drop, or a parked file on its way out of the notch.
++        guard !drag.isEmpty, model.shelf.isDraggingOut == false,
++            urls.isEmpty || !urls.allSatisfy(NotchShelf.contains)
++        else { return }
+         menuCloseTask?.cancel()
+@@ -820,3 +871,3 @@ final class NotchIslandController {
+         model.closeMenu()
+-        model.fileDrag = NotchFileDrag(urls: urls)
++        model.fileDrag = drag
+         dragReleasedAt = nil
+@@ -960,6 +1011,6 @@ final class NotchIslandController {
+ extension NotchIslandController: NotchDropHandling {
+-    func dragEntered(with urls: [URL]) {
++    func dragEntered(with urls: [URL], hasPromises: Bool) {
+         // Normally the drag was already noticed on its way here; if not, it starts now.
+-        if model.fileDrag == nil, !urls.isEmpty {
+-            beginFileDrag(urls)
++        if model.fileDrag == nil {
++            beginFileDrag(urls, hasPromises: urls.isEmpty && hasPromises)
+         }
+@@ -987,6 +1038,11 @@ extension NotchIslandController: NotchDropHandling {
+ 
+-    func dropFiles(_ urls: [URL], at point: NSPoint) -> Bool {
++    func dropFiles(_ urls: [URL], promises: [NSFilePromiseReceiver], at point: NSPoint) -> Bool {
++        guard model.fileDrag != nil else {
++            endFileDrag()
++            return false
++        }
+         let action = model.dropAction(at: point) ?? model.dropZone
+-        let files = urls.isEmpty ? (model.fileDrag?.urls ?? []) : urls
+-        guard let action, !files.isEmpty, NotchFileDrag(urls: files).allows(action) else {
++        let files = urls.isEmpty && promises.isEmpty ? (model.fileDrag?.urls ?? []) : urls
++        let drag = NotchFileDrag(urls: files, hasPromises: !promises.isEmpty)
++        guard let action, drag.allows(action) else {
+             endFileDrag()
+@@ -996,3 +1052,4 @@ extension NotchIslandController: NotchDropHandling {
+         endFileDrag()
+-        fileActions.perform(action, on: files)
++        // Promised files have to be asked for while the drop is still going on.
++        fileActions.perform(action, urls: files, promises: promises)
+         return true
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchShelf.swift b/VoiceInk/Features/Recording/Presentation/NotchShelf.swift
+new file mode 100644
+index 0000000..c9bb88f
+--- /dev/null
++++ b/VoiceInk/Features/Recording/Presentation/NotchShelf.swift
+@@ -0,0 +1,227 @@
++import AppKit
++import QuickLookThumbnailing
++import os
++
++/// Files parked on the notch ("Park"): dropped there from any app and dragged out again into any
++/// other, e.g. a PDF from WhatsApp into a Claude chat. The shelf keeps its own copy of each file
++/// (an instant clone on the same disk), so files that an app only lends for the drag stay there.
++@MainActor
++final class NotchShelf: ObservableObject {
++    struct Item: Identifiable, Equatable {
++        let id = UUID()
++        let name: String
++        /// The shelf's copy; nil while it is still being written.
++        var url: URL?
++        var thumbnail: NSImage?
++    }
++
++    @Published private(set) var items: [Item] = []
++    /// A file is being dragged out of the shelf right now.
++    @Published private(set) var isDraggingOut = false
++
++    nonisolated static let folder = FileManager.default.temporaryDirectory
++        .appendingPathComponent("VoiceInk Notch Shelf", isDirectory: true)
++
++    private var dragWatch: Task<Void, Never>?
++    private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "NotchShelf")
++
++    init() {
++        // Leftovers from the last run.
++        try? FileManager.default.removeItem(at: Self.folder)
++    }
++
++    /// Whether a file is one of the shelf's own, so dragging it out is not taken for a new file.
++    nonisolated static func contains(_ url: URL) -> Bool {
++        let base = folder.resolvingSymlinksInPath().path + "/"
++        return url.resolvingSymlinksInPath().path.hasPrefix(base)
++    }
++
++    // MARK: Adding
++
++    func add(_ urls: [URL]) {
++        for source in urls {
++            let item = Item(name: source.lastPathComponent, url: nil, thumbnail: NSWorkspace.shared.icon(forFile: source.path))
++            items.append(item)
++            let id = item.id
++            let target = Self.folder
++                .appendingPathComponent(id.uuidString, isDirectory: true)
++                .appendingPathComponent(source.lastPathComponent)
++            Task.detached(priority: .userInitiated) { [weak self] in
++                let copied = NotchPromisedFiles.copy(source, to: target)
++                await self?.finishCopy(id, url: copied)
++            }
++        }
++    }
++
++    /// Promised files (WhatsApp, Mail …): asked for during the drop, they appear once written.
++    func receive(_ promises: [NSFilePromiseReceiver]) {
++        guard !promises.isEmpty else { return }
++        NotchPromisedFiles.receiveEach(promises) { [weak self] url in
++            self?.append(url)
++        }
++    }
++
++    private func finishCopy(_ id: UUID, url: URL?) {
++        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
++        guard let url else {
++            logger.error("Notch shelf: could not copy \(self.items[index].name, privacy: .public)")
++            items.remove(at: index)
++            return
++        }
++        items[index].url = url
++        loadThumbnail(for: id, url: url)
++    }
++
++    private func append(_ url: URL) {
++        let item = Item(name: url.lastPathComponent, url: url, thumbnail: NSWorkspace.shared.icon(forFile: url.path))
++        items.append(item)
++        loadThumbnail(for: item.id, url: url)
++    }
++
++    /// A preview of the content (first PDF page, picture …) instead of the plain file icon.
++    private func loadThumbnail(for id: UUID, url: URL) {
++        let request = QLThumbnailGenerator.Request(
++            fileAt: url,
++            size: CGSize(width: 76, height: 76),
++            scale: NSScreen.main?.backingScaleFactor ?? 2,
++            representationTypes: .thumbnail
++        )
++        Task { @MainActor [weak self] in
++            guard let representation = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request),
++                let self,
++                let index = self.items.firstIndex(where: { $0.id == id })
++            else { return }
++            self.items[index].thumbnail = representation.nsImage
++        }
++    }
++
++    // MARK: Removing
++
++    func remove(_ id: UUID) {
++        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
++        let item = items.remove(at: index)
++        guard let url = item.url else { return }
++        // The app the file just went to may still be reading it.
++        Task.detached(priority: .utility) {
++            try? await Task.sleep(nanoseconds: 120_000_000_000)
++            NotchPromisedFiles.delete(url)
++        }
++    }
++
++    func removeAll() {
++        for item in items {
++            remove(item.id)
++        }
++    }
++
++    // MARK: Dragging out
++
++    func dragStarted() {
++        isDraggingOut = true
++        dragWatch?.cancel()
++        dragWatch = Task { @MainActor [weak self] in
++            // Fallback in case the end of the drag is never reported.
++            while !Task.isCancelled, NSEvent.pressedMouseButtons & 1 == 1 {
++                try? await Task.sleep(nanoseconds: 200_000_000)
++            }
++            try? await Task.sleep(nanoseconds: 1_500_000_000)
++            guard let self, !Task.isCancelled else { return }
++            self.isDraggingOut = false
++        }
++    }
++
++    /// Parked files are only on their way somewhere: once delivered, they leave the shelf.
++    func dragEnded(_ id: UUID, delivered: Bool) {
++        dragWatch?.cancel()
++        dragWatch = nil
++        isDraggingOut = false
++        if delivered {
++            remove(id)
++        }
++    }
++}
++
++/// File work off the main thread: copies, promised files, cleanup.
++enum NotchPromisedFiles {
++    /// One at a time, so the callbacks below never run at the same moment.
++    private static let queue: OperationQueue = {
++        let queue = OperationQueue()
++        queue.maxConcurrentOperationCount = 1
++        queue.qualityOfService = .userInitiated
++        return queue
++    }()
++
++    static func copy(_ source: URL, to target: URL) -> URL? {
++        do {
++            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
++            try FileManager.default.copyItem(at: source, to: target)
++            return target
++        } catch {
++            return nil
++        }
++    }
++
++    /// Deletes a shelf file and its folder once that is empty.
++    static func delete(_ url: URL) {
++        let folder = url.deletingLastPathComponent()
++        try? FileManager.default.removeItem(at: url)
++        if let rest = try? FileManager.default.contentsOfDirectory(atPath: folder.path), rest.isEmpty {
++            try? FileManager.default.removeItem(at: folder)
++        }
++    }
++
++    private static func newFolder() -> URL {
++        let folder = NotchShelf.folder.appendingPathComponent(UUID().uuidString, isDirectory: true)
++        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
++        return folder
++    }
++
++    /// Asks for each promised file; "arrived" runs on the main thread for every file written.
++    static func receiveEach(_ promises: [NSFilePromiseReceiver], arrived: @escaping @Sendable @MainActor (URL) -> Void) {
++        for promise in promises {
++            promise.receivePromisedFiles(atDestination: newFolder(), options: [:], operationQueue: queue) { url, error in
++                guard error == nil else { return }
++                Task { @MainActor in
++                    arrived(url)
++                }
++            }
++        }
++    }
++
++    /// Asks for all promised files; "completion" runs on the main thread once all have arrived.
++    static func receiveAll(_ promises: [NSFilePromiseReceiver], completion: @escaping @Sendable @MainActor ([URL]) -> Void) {
++        let expected = promises.reduce(0) { $0 + max(1, $1.fileTypes.count) }
++        guard expected > 0 else {
++            Task { @MainActor in
++                completion([])
++            }
++            return
++        }
++        let folder = newFolder()
++        let collector = Collector(remaining: expected)
++        for promise in promises {
++            promise.receivePromisedFiles(atDestination: folder, options: [:], operationQueue: queue) { url, error in
++                if error == nil {
++                    collector.received.append(url)
++                }
++                collector.remaining -= 1
++                if collector.remaining == 0 {
++                    let urls = collector.received
++                    Task { @MainActor in
++                        completion(urls)
++                    }
++                }
++            }
++        }
++    }
++
++    /// Counts the files still to come; only touched on the serial queue above.
++    private final class Collector: @unchecked Sendable {
++        var remaining: Int
++        var received: [URL] = []
++
++        init(remaining: Int) {
++            self.remaining = remaining
++        }
++    }
++}
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 8bd6b92..387f200 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -114,2 +114,3 @@ struct NotchIslandView: View {
+             playerPanel(phase: phase)
++            shelfPanel(phase: phase)
+         }
+@@ -151,5 +152,5 @@ struct NotchIslandView: View {
+             return NotchIslandShape(topCornerRadius: 4, bottomCornerRadius: 8)
+-        case .hover, .menu, .recording, .processing, .music, .dropReady, .fileTask:
++        case .hover, .menu, .recording, .processing, .music, .dropReady, .fileTask, .shelfPeek:
+             return NotchIslandShape(topCornerRadius: 8, bottomCornerRadius: 14)
+-        case .liveText, .assistant, .dropTarget:
++        case .liveText, .assistant, .dropTarget, .shelf:
+             return NotchIslandShape(topCornerRadius: 12, bottomCornerRadius: 22)
+@@ -216,3 +217,3 @@ struct NotchIslandView: View {
+         switch phase {
+-        case .hidden, .idle, .hover, .music, .menu, .player, .recording, .liveText, .fileTask:
++        case .hidden, .idle, .hover, .music, .menu, .player, .recording, .liveText, .fileTask, .shelf, .shelfPeek:
+             return true
+@@ -225,3 +226,3 @@ struct NotchIslandView: View {
+         switch phase {
+-        case .hidden, .idle, .hover, .music:
++        case .hidden, .idle, .hover, .music, .shelf, .shelfPeek:
+             model.openMenu()
+@@ -255,5 +256,12 @@ struct NotchIslandView: View {
+             case .fileTask:
+-                Image(systemName: model.fileTask?.kind == .mp3 ? "music.note" : "text.bubble.fill")
++                Image(systemName: "exclamationmark.triangle.fill")
+                     .font(.system(size: 11, weight: .semibold))
+-                    .foregroundStyle(NotchIslandStyle.gold)
++                    .foregroundStyle(Color.orange)
++            case .shelf:
++                Image(systemName: "tray.full.fill")
++                    .font(.system(size: 11, weight: .semibold))
++                    .symbolRenderingMode(.hierarchical)
++                    .foregroundStyle(Color.white.opacity(0.85))
++            case .shelfPeek:
++                shelfPreview
+             case .recording, .liveText, .processing:
+@@ -319,9 +327,11 @@ struct NotchIslandView: View {
+             case .fileTask:
+-                if model.fileTask?.isFinished == false {
+-                    NotchIslandProcessingDots()
++                Color.clear
++            case .shelf:
++                if model.shelfItems.count > 1 {
++                    clearShelfButton
+                 } else {
+-                    Image(systemName: fileTaskSymbol)
+-                        .font(.system(size: 12, weight: .semibold))
+-                        .foregroundStyle(NotchIslandStyle.gold)
++                    Color.clear
+                 }
++            case .shelfPeek:
++                countBadge(model.shelfItems.count)
+             case .recording, .liveText:
+@@ -352,8 +362,3 @@ struct NotchIslandView: View {
+         if count > 1 {
+-            Text(verbatim: String(count))
+-                .font(.system(size: 10.5, weight: .bold).monospacedDigit())
+-                .foregroundStyle(Color.black)
+-                .padding(.horizontal, 5)
+-                .frame(minWidth: 18, minHeight: 18)
+-                .background(Capsule().fill(Color.white.opacity(0.9)))
++            countBadge(count)
+         } else {
+@@ -368,5 +373,40 @@ struct NotchIslandView: View {
+ 
+-    private var fileTaskSymbol: String {
+-        if case .failed = model.fileTask?.state { return "exclamationmark" }
+-        return "checkmark"
++    private func countBadge(_ count: Int) -> some View {
++        Text(verbatim: String(count))
++            .font(.system(size: 10.5, weight: .bold).monospacedDigit())
++            .foregroundStyle(Color.black)
++            .padding(.horizontal, 5)
++            .frame(minWidth: 18, minHeight: 18)
++            .background(Capsule().fill(Color.white.opacity(0.9)))
++    }
++
++    /// The newest parked file, small beside the notch.
++    @ViewBuilder
++    private var shelfPreview: some View {
++        if let image = model.shelfItems.last?.thumbnail {
++            Image(nsImage: image)
++                .resizable()
++                .interpolation(.high)
++                .aspectRatio(contentMode: .fit)
++                .frame(width: 20, height: 20)
++        } else {
++            Image(systemName: "tray.full.fill")
++                .font(.system(size: 11, weight: .semibold))
++                .foregroundStyle(Color.white.opacity(0.85))
++        }
++    }
++
++    private var clearShelfButton: some View {
++        Button {
++            model.shelf.removeAll()
++        } label: {
++            Image(systemName: "xmark")
++                .font(.system(size: 8.5, weight: .bold))
++                .foregroundStyle(Color.white.opacity(0.85))
++                .frame(width: 20, height: 20)
++                .background(Circle().fill(Color.white.opacity(0.14)))
++                .contentShape(Circle())
++        }
++        .buttonStyle(NotchPressStyle(hoverScale: 1.12))
++        .help(Text("Remove All", tableName: "NotchIsland"))
+     }
+@@ -400,2 +440,11 @@ struct NotchIslandView: View {
+ 
++    @ViewBuilder
++    private func shelfPanel(phase: NotchIslandPhase) -> some View {
++        if phase == .shelf {
++            NotchShelfPanel(model: model, shelf: model.shelf)
++                .frame(height: NotchIslandModel.shelfPanelHeight)
++                .transition(.opacity)
++        }
++    }
++
+     @ViewBuilder
+@@ -924,4 +973,4 @@ struct NotchMusicBars: View {
+ 
+-/// The targets a dragged file can be dropped on: transcribe, convert to MP3, AirDrop. Quiet
+-/// tiles like Apple's share sheet; the one under the file lifts a little and lights up.
++/// The targets a dragged file can be dropped on: park it on the notch, or AirDrop. Quiet tiles
++/// like Apple's share sheet; the one under the file lifts a little and lights up.
+ struct NotchDropZones: View {
+@@ -932,4 +981,3 @@ struct NotchDropZones: View {
+         HStack(spacing: NotchIslandModel.dropTileSpacing) {
+-            target(.transcribe, symbol: "waveform", title: Text("Transcribe", tableName: "NotchIsland"))
+-            target(.mp3, symbol: "music.note", title: Text(verbatim: "MP3"))
++            target(.shelf, symbol: "tray.and.arrow.down.fill", title: Text("Park", tableName: "NotchIsland"))
+             target(.airDrop, symbol: "dot.radiowaves.left.and.right", title: Text(verbatim: "AirDrop"))
+@@ -992,3 +1040,3 @@ struct NotchDropTarget: View {
+ 
+-/// Card below the notch while a dropped file is processed, and with the result.
++/// Card below the notch when a drop did not work.
+ struct NotchFileTaskCard: View {
+@@ -997,7 +1045,7 @@ struct NotchFileTaskCard: View {
+ 
+-    @State private var copied = false
+-
+     var body: some View {
+         HStack(alignment: .top, spacing: 12) {
+-            statusIcon
++            Image(systemName: "exclamationmark.triangle.fill")
++                .font(.system(size: 19))
++                .foregroundStyle(Color.orange)
+                 .frame(width: 26, height: 26)
+@@ -1005,3 +1053,3 @@ struct NotchFileTaskCard: View {
+             VStack(alignment: .leading, spacing: 4) {
+-                title
++                Text("Failed", tableName: "NotchIsland")
+                     .font(.system(size: 12.5, weight: .semibold))
+@@ -1009,3 +1057,3 @@ struct NotchFileTaskCard: View {
+                     .lineLimit(1)
+-                Text(verbatim: detail)
++                Text(verbatim: task.fileName.isEmpty ? task.message : task.message + " · " + task.fileName)
+                     .font(.system(size: 11.5))
+@@ -1016,15 +1064,11 @@ struct NotchFileTaskCard: View {
+ 
+-            VStack(alignment: .trailing, spacing: 8) {
+-                Button(action: onDismiss) {
+-                    Image(systemName: "xmark")
+-                        .font(.system(size: 9, weight: .bold))
+-                        .foregroundStyle(Color.white.opacity(0.7))
+-                        .frame(width: 20, height: 20)
+-                        .background(Circle().fill(Color.white.opacity(0.1)))
+-                        .contentShape(Circle())
+-                }
+-                .buttonStyle(NotchPressStyle(hoverScale: 1.12))
+-
+-                actionButton
++            Button(action: onDismiss) {
++                Image(systemName: "xmark")
++                    .font(.system(size: 9, weight: .bold))
++                    .foregroundStyle(Color.white.opacity(0.7))
++                    .frame(width: 20, height: 20)
++                    .background(Circle().fill(Color.white.opacity(0.1)))
++                    .contentShape(Circle())
+             }
++            .buttonStyle(NotchPressStyle(hoverScale: 1.12))
+         }
+@@ -1039,89 +1083,177 @@ struct NotchFileTaskCard: View {
+     }
++}
+ 
+-    @ViewBuilder
+-    private var statusIcon: some View {
+-        switch task.state {
+-        case .working:
+-            ProgressView()
+-                .progressViewStyle(.circular)
+-                .controlSize(.small)
+-        case .transcript, .saved:
+-            Image(systemName: "checkmark.circle.fill")
+-                .font(.system(size: 22))
+-                .foregroundStyle(NotchIslandStyle.gold)
+-        case .failed:
+-            Image(systemName: "exclamationmark.triangle.fill")
+-                .font(.system(size: 19))
+-                .foregroundStyle(Color.orange)
+-        }
+-    }
++// MARK: - Shelf
+ 
+-    private var title: Text {
+-        switch task.state {
+-        case .working:
+-            return task.kind == .mp3
+-                ? Text("Converting to MP3…", tableName: "NotchIsland")
+-                : Text("Transcribing…", tableName: "NotchIsland")
+-        case .transcript:
+-            return Text("Transcript copied", tableName: "NotchIsland")
+-        case .saved:
+-            return Text("MP3 saved", tableName: "NotchIsland")
+-        case .failed:
+-            return Text("Failed", tableName: "NotchIsland")
++/// The files parked on the notch, side by side; more than four scroll.
++struct NotchShelfPanel: View {
++    @ObservedObject var model: NotchIslandModel
++    let shelf: NotchShelf
++
++    var body: some View {
++        Group {
++            if model.shelfItems.count > 4 {
++                ScrollView(.horizontal, showsIndicators: false) {
++                    tiles
++                        .padding(.horizontal, NotchIslandModel.dropPanelInset)
++                }
++            } else {
++                tiles
++                    .frame(maxWidth: .infinity)
++            }
+         }
++        .padding(.top, 2)
++        .padding(.bottom, 14)
+     }
+ 
+-    private var detail: String {
+-        switch task.state {
+-        case .working:
+-            return task.fileName
+-        case .transcript(let text):
+-            return text
+-        case .saved(let url):
+-            return url.lastPathComponent
+-        case .failed(let message):
+-            return message
++    private var tiles: some View {
++        HStack(spacing: NotchIslandModel.dropTileSpacing) {
++            ForEach(model.shelfItems) { item in
++                NotchShelfTile(item: item, shelf: shelf)
++            }
+         }
+     }
++}
+ 
+-    @ViewBuilder
+-    private var actionButton: some View {
+-        switch task.state {
+-        case .transcript(let text):
+-            pillButton(symbol: copied ? "checkmark" : "doc.on.doc", title: copied
+-                ? Text("Copied", tableName: "NotchIsland")
+-                : Text("Copy", tableName: "NotchIsland")
+-            ) {
+-                guard ClipboardManager.copyToClipboard(text) else { return }
+-                copied = true
+-                Task { @MainActor in
+-                    try? await Task.sleep(nanoseconds: 1_600_000_000)
+-                    copied = false
++/// One parked file: preview and name. Drag it out into any app (it then leaves the notch),
++/// double-click opens it, the small cross removes it.
++struct NotchShelfTile: View {
++    let item: NotchShelf.Item
++    let shelf: NotchShelf
++
++    @State private var hovering = false
++
++    var body: some View {
++        VStack(spacing: 5) {
++            ZStack {
++                if let thumbnail = item.thumbnail {
++                    Image(nsImage: thumbnail)
++                        .resizable()
++                        .interpolation(.high)
++                        .aspectRatio(contentMode: .fit)
++                } else {
++                    Image(systemName: "doc.fill")
++                        .font(.system(size: 20, weight: .semibold))
++                        .foregroundStyle(Color.white.opacity(0.8))
++                }
++                if item.url == nil {
++                    ProgressView()
++                        .progressViewStyle(.circular)
++                        .controlSize(.small)
+                 }
+             }
+-        case .saved(let url):
+-            pillButton(symbol: "folder", title: Text("Show in Finder", tableName: "NotchIsland")) {
+-                NSWorkspace.shared.activateFileViewerSelecting([url])
++            .frame(width: 38, height: 38)
++            .overlay {
++                if let url = item.url {
++                    let id = item.id
++                    NotchShelfDragSource(
++                        url: url,
++                        image: item.thumbnail,
++                        onStart: { shelf.dragStarted() },
++                        onEnd: { delivered in shelf.dragEnded(id, delivered: delivered) }
++                    )
++                }
+             }
+-        case .working, .failed:
+-            EmptyView()
++
++            Text(verbatim: item.name)
++                .font(.system(size: 10, weight: .medium))
++                .foregroundStyle(Color.white.opacity(0.75))
++                .lineLimit(1)
++                .truncationMode(.middle)
++                .frame(width: NotchIslandModel.shelfTileWidth - 10)
++        }
++        .frame(width: NotchIslandModel.shelfTileWidth, height: 66)
++        .background(
++            RoundedRectangle(cornerRadius: 14, style: .continuous)
++                .fill(Color.white.opacity(hovering ? 0.12 : 0.06))
++        )
++        // Beside the preview, so it never sits on top of the area that starts a drag.
++        .overlay(alignment: .topTrailing) {
++            if hovering {
++                Button {
++                    shelf.remove(item.id)
++                } label: {
++                    Image(systemName: "xmark")
++                        .font(.system(size: 7, weight: .bold))
++                        .foregroundStyle(Color.white.opacity(0.9))
++                        .frame(width: 14, height: 14)
++                        .background(Circle().fill(Color.white.opacity(0.22)))
++                        .contentShape(Circle())
++                }
++                .buttonStyle(NotchPressStyle(hoverScale: 1.15))
++                .help(Text("Remove", tableName: "NotchIsland"))
++                .padding(3)
++                .transition(.opacity)
++            }
++        }
++        .scaleEffect(hovering ? 1.04 : 1)
++        .animation(.spring(response: 0.3, dampingFraction: 0.72), value: hovering)
++        .onHover { inside in
++            hovering = inside
+         }
+     }
++}
+ 
+-    private func pillButton(symbol: String, title: Text, action: @escaping () -> Void) -> some View {
+-        Button(action: action) {
+-            HStack(spacing: 4) {
+-                Image(systemName: symbol)
+-                    .font(.system(size: 9.5, weight: .bold))
+-                title
+-                    .font(.system(size: 11, weight: .semibold))
+-                    .lineLimit(1)
+-            }
+-            .foregroundStyle(Color.white)
+-            .padding(.horizontal, 10)
+-            .frame(height: 24)
+-            .background(Capsule().fill(Color.white.opacity(0.16)))
+-            .contentShape(Capsule())
++/// Lets a parked file be dragged out of the notch (plain AppKit, which works in this panel and
++/// reports whether the file was taken).
++struct NotchShelfDragSource: NSViewRepresentable {
++    let url: URL
++    let image: NSImage?
++    let onStart: () -> Void
++    let onEnd: (Bool) -> Void
++
++    func makeNSView(context: Context) -> NotchShelfDragView {
++        NotchShelfDragView()
++    }
++
++    func updateNSView(_ view: NotchShelfDragView, context: Context) {
++        view.url = url
++        view.image = image
++        view.onStart = onStart
++        view.onEnd = onEnd
++        view.toolTip = String(localized: "Drag into any app. Double-click opens it.", table: "NotchIsland")
++    }
++}
++
++final class NotchShelfDragView: NSView, NSDraggingSource {
++    var url: URL?
++    var image: NSImage?
++    var onStart: (() -> Void)?
++    var onEnd: ((Bool) -> Void)?
++    private var mouseDownLocation: NSPoint?
++
++    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
++
++    override func mouseDown(with event: NSEvent) {
++        mouseDownLocation = event.locationInWindow
++        if event.clickCount == 2, let url {
++            mouseDownLocation = nil
++            NSWorkspace.shared.open(url)
+         }
+-        .buttonStyle(NotchPressStyle())
++    }
++
++    override func mouseUp(with event: NSEvent) {
++        mouseDownLocation = nil
++    }
++
++    override func mouseDragged(with event: NSEvent) {
++        guard let start = mouseDownLocation, let url else { return }
++        let location = event.locationInWindow
++        guard abs(location.x - start.x) > 3 || abs(location.y - start.y) > 3 else { return }
++        mouseDownLocation = nil
++
++        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
++        item.setDraggingFrame(bounds, contents: image ?? NSWorkspace.shared.icon(forFile: url.path))
++        onStart?()
++        let session = beginDraggingSession(with: [item], event: event, source: self)
++        session.animatesToStartingPositionsOnCancelOrFail = true
++    }
++
++    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
++        // Into other apps only, not back onto the notch.
++        context == .outsideApplication ? .copy : []
++    }
++
++    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
++        onEnd?(operation != [])
+     }
+diff --git a/VoiceInk/NotchIsland.xcstrings b/VoiceInk/NotchIsland.xcstrings
+index 6883d45..daa40cb 100644
+--- a/VoiceInk/NotchIsland.xcstrings
++++ b/VoiceInk/NotchIsland.xcstrings
+@@ -51,34 +51,2 @@
+     },
+-    "Choose a mode in VoiceInk first." : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Wähle zuerst einen Modus in VoiceInk."
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Choisissez d’abord un mode dans VoiceInk."
+-          }
+-        }
+-      }
+-    },
+-    "Converting to MP3…" : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Wird in MP3 umgewandelt …"
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Conversion en MP3…"
+-          }
+-        }
+-      }
+-    },
+     "Copied" : {
+@@ -131,3 +99,3 @@
+     },
+-    "Failed" : {
++    "Drag into any app. Double-click opens it." : {
+       "localizations" : {
+@@ -136,3 +104,3 @@
+             "state" : "translated",
+-            "value" : "Fehlgeschlagen"
++            "value" : "In eine beliebige App ziehen. Doppelklick öffnet die Datei."
+           }
+@@ -142,3 +110,3 @@
+             "state" : "translated",
+-            "value" : "Échec"
++            "value" : "Faites-le glisser vers n’importe quelle app. Double-cliquez pour l’ouvrir."
+           }
+@@ -147,3 +115,3 @@
+     },
+-    "Failed - Live Text" : {
++    "Failed" : {
+       "localizations" : {
+@@ -152,3 +120,3 @@
+             "state" : "translated",
+-            "value" : "Fehlgeschlagen · Live-Text"
++            "value" : "Fehlgeschlagen"
+           }
+@@ -158,3 +126,3 @@
+             "state" : "translated",
+-            "value" : "Échec · texte en direct"
++            "value" : "Échec"
+           }
+@@ -163,3 +131,3 @@
+     },
+-    "ffmpeg was not found. Open VideoLoader once, or install ffmpeg with Homebrew." : {
++    "Failed - Live Text" : {
+       "localizations" : {
+@@ -168,3 +136,3 @@
+             "state" : "translated",
+-            "value" : "ffmpeg wurde nicht gefunden. Öffne VideoLoader einmal oder installiere ffmpeg mit Homebrew."
++            "value" : "Fehlgeschlagen · Live-Text"
+           }
+@@ -174,3 +142,3 @@
+             "state" : "translated",
+-            "value" : "ffmpeg est introuvable. Ouvrez VideoLoader une fois ou installez ffmpeg avec Homebrew."
++            "value" : "Échec · texte en direct"
+           }
+@@ -227,3 +195,3 @@
+     },
+-    "MP3 saved" : {
++    "Nothing dictated yet." : {
+       "localizations" : {
+@@ -232,3 +200,3 @@
+             "state" : "translated",
+-            "value" : "MP3 gespeichert"
++            "value" : "Noch nichts diktiert."
+           }
+@@ -238,3 +206,3 @@
+             "state" : "translated",
+-            "value" : "MP3 enregistré"
++            "value" : "Rien n’a encore été dicté."
+           }
+@@ -243,3 +211,3 @@
+     },
+-    "Nothing dictated yet." : {
++    "Park" : {
+       "localizations" : {
+@@ -248,3 +216,3 @@
+             "state" : "translated",
+-            "value" : "Noch nichts diktiert."
++            "value" : "Ablegen"
+           }
+@@ -254,3 +222,3 @@
+             "state" : "translated",
+-            "value" : "Rien n’a encore été dicté."
++            "value" : "Déposer"
+           }
+@@ -259,3 +227,3 @@
+     },
+-    "Nothing was recognized." : {
++    "Remove" : {
+       "localizations" : {
+@@ -264,3 +232,3 @@
+             "state" : "translated",
+-            "value" : "Es wurde nichts erkannt."
++            "value" : "Entfernen"
+           }
+@@ -270,3 +238,3 @@
+             "state" : "translated",
+-            "value" : "Rien n’a été reconnu."
++            "value" : "Retirer"
+           }
+@@ -275,3 +243,3 @@
+     },
+-    "Retry" : {
++    "Remove All" : {
+       "localizations" : {
+@@ -280,3 +248,3 @@
+             "state" : "translated",
+-            "value" : "Erneut"
++            "value" : "Alle entfernen"
+           }
+@@ -286,3 +254,3 @@
+             "state" : "translated",
+-            "value" : "Réessayer"
++            "value" : "Tout retirer"
+           }
+@@ -291,3 +259,3 @@
+     },
+-    "Screen Glow While Dictating" : {
++    "Retry" : {
+       "localizations" : {
+@@ -296,3 +264,3 @@
+             "state" : "translated",
+-            "value" : "Bildschirmrand leuchtet beim Diktieren"
++            "value" : "Erneut"
+           }
+@@ -302,3 +270,3 @@
+             "state" : "translated",
+-            "value" : "Bords de l’écran lumineux pendant la dictée"
++            "value" : "Réessayer"
+           }
+@@ -307,3 +275,3 @@
+     },
+-    "Show in Finder" : {
++    "Screen Glow While Dictating" : {
+       "localizations" : {
+@@ -312,3 +280,3 @@
+             "state" : "translated",
+-            "value" : "Im Finder zeigen"
++            "value" : "Bildschirmrand leuchtet beim Diktieren"
+           }
+@@ -318,3 +286,3 @@
+             "state" : "translated",
+-            "value" : "Afficher dans le Finder"
++            "value" : "Bords de l’écran lumineux pendant la dictée"
+           }
+@@ -387,82 +355,2 @@
+     },
+-    "The file could not be converted." : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Die Datei konnte nicht umgewandelt werden."
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Le fichier n’a pas pu être converti."
+-          }
+-        }
+-      }
+-    },
+-    "These files are already being transcribed." : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Diese Dateien werden bereits transkribiert."
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Ces fichiers sont déjà en cours de transcription."
+-          }
+-        }
+-      }
+-    },
+-    "Transcribe" : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Transkribieren"
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Transcrire"
+-          }
+-        }
+-      }
+-    },
+-    "Transcribing…" : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Wird transkribiert …"
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Transcription…"
+-          }
+-        }
+-      }
+-    },
+-    "Transcript copied" : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Transkript kopiert"
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Transcription copiée"
+-          }
+-        }
+-      }
+-    },
+     "Transcription Failed" : {
