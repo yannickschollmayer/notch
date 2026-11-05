@@ -1,0 +1,564 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index 5a78cae..e76201f 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -15,11 +15,6 @@ enum NotchIslandSettings {
+     }
+ }
+ 
+-extension Notification.Name {
+-    /// A dictation was not pasted anywhere; its text is on the clipboard.
+-    static let notchPasteTargetMissing = Notification.Name("NotchPasteTargetMissing")
+-}
+-
+ /// The most recent dictation, shown in the notch menu so it can be copied again.
+ struct NotchLastDictation: Equatable {
+     let text: String
+@@ -77,8 +72,6 @@ enum NotchIslandPhase: Equatable {
+     case hover
+     /// Opened by a click: language choice and the last dictation to copy.
+     case menu
+-    /// "Copied, press ⌘V": shown when a dictation found no text field.
+-    case notice
+     /// Listening. Slightly larger than the notch and glowing.
+     case recording
+     /// Transcribing / AI clean-up.
+@@ -91,7 +84,7 @@ enum NotchIslandPhase: Equatable {
+     var isActive: Bool {
+         switch self {
+         case .recording, .processing, .liveText, .assistant: return true
+-        case .hidden, .idle, .hover, .menu, .notice: return false
++        case .hidden, .idle, .hover, .menu: return false
+         }
+     }
+ 
+@@ -99,7 +92,7 @@ enum NotchIslandPhase: Equatable {
+     var showsScreenGlow: Bool {
+         switch self {
+         case .recording, .liveText, .processing: return true
+-        case .hidden, .idle, .hover, .menu, .notice, .assistant: return false
++        case .hidden, .idle, .hover, .menu, .assistant: return false
+         }
+     }
+ }
+@@ -121,11 +114,9 @@ final class NotchIslandModel: ObservableObject {
+     /// so it can still be copied when the final transcription fails.
+     @Published private(set) var lastLiveText = ""
+     @Published private(set) var lastDictation: NotchLastDictation?
+-    @Published private(set) var noticeVisible = false
+ 
+     private let modelContext: ModelContext
+     private var cancellables = Set<AnyCancellable>()
+-    private var noticeTask: Task<Void, Never>?
+ 
+     // Extra width on each side of the notch and extra height below it, per phase.
+     /// Hovering already shows the island at its dictation size.
+@@ -139,7 +130,6 @@ final class NotchIslandModel: ObservableObject {
+     static let assistantPanelHeight: CGFloat = 320
+     /// Glass cards that drop down below the island.
+     static let menuCardSize = CGSize(width: 380, height: 150)
+-    static let noticeCardSize = CGSize(width: 320, height: 60)
+     static let cardGap: CGFloat = 8
+     /// Room around the island for the glow.
+     static let glowPadding: CGFloat = 34
+@@ -157,7 +147,6 @@ final class NotchIslandModel: ObservableObject {
+                 case .starting:
+                     self.lastLiveText = ""
+                     self.menuOpen = false
+-                    self.dismissNotice()
+                 case .recording:
+                     self.menuOpen = false
+                 case .idle, .transcribing, .enhancing, .busy:
+@@ -191,38 +180,11 @@ final class NotchIslandModel: ObservableObject {
+                 self.reloadLastDictation()
+             }
+             .store(in: &cancellables)
+-
+-        NotificationCenter.default.publisher(for: .notchPasteTargetMissing)
+-            .receive(on: DispatchQueue.main)
+-            .sink { [weak self] _ in self?.showNotice() }
+-            .store(in: &cancellables)
+-    }
+-
+-    // MARK: Notice
+-
+-    func showNotice() {
+-        guard !menuOpen else { return }
+-        noticeTask?.cancel()
+-        noticeVisible = true
+-        noticeTask = Task { @MainActor [weak self] in
+-            try? await Task.sleep(nanoseconds: 4_500_000_000)
+-            guard !Task.isCancelled else { return }
+-            self?.noticeVisible = false
+-        }
+-    }
+-
+-    func dismissNotice() {
+-        noticeTask?.cancel()
+-        noticeTask = nil
+-        if noticeVisible {
+-            noticeVisible = false
+-        }
+     }
+ 
+     // MARK: Menu
+ 
+     func openMenu() {
+-        dismissNotice()
+         reloadLastDictation()
+         menuOpen = true
+     }
+@@ -269,7 +231,6 @@ final class NotchIslandModel: ObservableObject {
+         }
+ 
+         if menuOpen { return .menu }
+-        if noticeVisible { return .notice }
+         if isHovering { return .hover }
+         return geometry.hasNotch ? .idle : .hidden
+     }
+@@ -298,7 +259,7 @@ final class NotchIslandModel: ObservableObject {
+             return CGSize(width: width + Self.activeWing * 2, height: row)
+         case .liveText:
+             return CGSize(width: width + Self.liveTextWing * 2, height: row + Self.liveTextPanelHeight)
+-        case .menu, .notice:
++        case .menu:
+             return CGSize(width: width + Self.menuWing * 2, height: row)
+         case .assistant:
+             return CGSize(width: width + Self.assistantWing * 2, height: row + Self.assistantPanelHeight)
+@@ -309,7 +270,6 @@ final class NotchIslandModel: ObservableObject {
+     func cardSize(for phase: NotchIslandPhase) -> CGSize? {
+         switch phase {
+         case .menu: return Self.menuCardSize
+-        case .notice: return Self.noticeCardSize
+         default: return nil
+         }
+     }
+@@ -637,7 +597,6 @@ final class NotchIslandController {
+     /// lets clicks fall through to the menu bar unless the pointer is actually on the island.
+     private func updatePointerState() {
+         guard let panel else { return }
+-        keepPointerOffTopEdge()
+         let inside = model.containsPointer(NSEvent.mouseLocation)
+ 
+         if panel.ignoresMouseEvents == inside {
+@@ -679,29 +638,6 @@ final class NotchIslandController {
+         }
+     }
+ 
+-    /// With "automatically hide the menu bar" on, touching the top screen edge reveals the menu
+-    /// bar. Over the island the pointer is held one point below the edge, so the menu bar only
+-    /// appears left or right of the notch.
+-    private func keepPointerOffTopEdge() {
+-        guard model.geometry.hasNotch, let primary = NSScreen.screens.first else { return }
+-        let location = NSEvent.mouseLocation
+-        let frame = model.geometry.screenFrame
+-        guard location.y >= frame.maxY - 1 else { return }
+-        let island = model.islandRect()
+-        guard location.x >= island.minX, location.x <= island.maxX else { return }
+-        // A display arranged above this one must stay reachable.
+-        let screenAbove = NSScreen.screens.contains {
+-            $0.frame.minY >= frame.maxY - 1 && $0.frame.minX < island.maxX && $0.frame.maxX > island.minX
+-        }
+-        guard !screenAbove else { return }
+-
+-        // Quartz coordinates start at the top-left of the primary display.
+-        let target = CGPoint(x: location.x, y: primary.frame.maxY - (frame.maxY - 2))
+-        CGWarpMouseCursorPosition(target)
+-        // Without this the pointer freezes for a moment after a warp.
+-        CGAssociateMouseAndMouseCursorPosition(1)
+-    }
+-
+     private func modelDidChange() {
+         guard let panel else { return }
+         let wantsKey = model.phase == .assistant
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index 860e4ff..4e16b66 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -35,7 +35,7 @@ final class NotchScreenGlowWindow {
+     private static let easing = CAMediaTimingFunction(controlPoints: 0.4, 0, 0.2, 1)
+ 
+     private static let speakingColors: [CGColor] = [
+-        0xFFE08A, 0xFDCA3F, 0xFCA311, 0xF59E0B, 0xFFD978, 0xFFFFFF, 0xFDCA3F, 0xFFE08A,
++        0xFFE08A, 0xFDCA3F, 0xFCA311, 0xF59E0B, 0xFFD978, 0xFFF1C2, 0xFDCA3F, 0xFFE08A,
+     ].map(color)
+     private static let processingColors: [CGColor] = [
+         0xFFFFFF, 0xE7E9EE, 0xB5BCC8, 0xFFE08A, 0xE7E9EE, 0xB5BCC8, 0xE7E9EE, 0xFFFFFF,
+@@ -278,17 +278,26 @@ final class NotchScreenGlowWindow {
+         "\(Int(size.width))x\(Int(size.height))"
+     }
+ 
+-    /// Soft white lines along the screen edge (alpha is what counts in a mask). Rendered at 1x:
+-    /// the light is soft anyway and the images stay small.
++    /// Edge masks (alpha is what counts in a mask), rendered at 1x since the light is soft:
++    /// - base: a thin bright line right at the screen edge plus a soft shimmer fading inwards,
++    /// - swell: a wider, gentle glow that only comes up when you speak.
+     nonisolated private static func renderMasks(size: CGSize) -> (base: CGImage, swell: CGImage)? {
+         guard
+-            let base = renderEdge(size: size, lineWidth: 6, blur: 16),
+-            let swell = renderEdge(size: size, lineWidth: 34, blur: 46)
++            let base = renderEdge(size: size, alpha: { distance in
++                let line = max(0, min(1, 1 - (distance - 1.2) / 1.6))
++                let shimmer = 0.5 * exp(-pow(distance / 14, 1.6))
++                return line + shimmer * (1 - line)
++            }),
++            let swell = renderEdge(size: size, alpha: { distance in
++                0.55 * exp(-pow(distance / 44, 1.4))
++            })
+         else { return nil }
+         return (base, swell)
+     }
+ 
+-    nonisolated private static func renderEdge(size: CGSize, lineWidth: CGFloat, blur: CGFloat) -> CGImage? {
++    /// Fills every pixel by its distance to the screen edge, so the falloff is perfectly smooth
++    /// and follows the rounded display corners.
++    nonisolated private static func renderEdge(size: CGSize, alpha: (CGFloat) -> CGFloat) -> CGImage? {
+         let width = max(1, Int(size.width.rounded(.up)))
+         let height = max(1, Int(size.height.rounded(.up)))
+         guard
+@@ -297,20 +306,48 @@ final class NotchScreenGlowWindow {
+                 width: width,
+                 height: height,
+                 bitsPerComponent: 8,
+-                bytesPerRow: 0,
++                bytesPerRow: width * 4,
+                 space: CGColorSpaceCreateDeviceRGB(),
+                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+-            )
++            ),
++            let data = context.data
+         else { return nil }
+ 
+-        let rect = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
+-        let path = CGPath(roundedRect: rect, cornerWidth: 12, cornerHeight: 12, transform: nil)
+-        let white = CGColor(gray: 1, alpha: 1)
+-        context.setShadow(offset: .zero, blur: blur, color: white)
+-        context.setStrokeColor(white)
+-        context.setLineWidth(lineWidth)
+-        context.addPath(path)
+-        context.strokePath()
++        let pixels = data.bindMemory(to: UInt8.self, capacity: width * height * 4)
++        let halfWidth = CGFloat(width) / 2
++        let halfHeight = CGFloat(height) / 2
++        // MacBook displays are rounded at the top; keep the bottom corners nearly square.
++        let topRadius: CGFloat = 10
++        let bottomRadius: CGFloat = 6
++        // Beyond this the light has faded to nothing, so the middle of the screen is skipped.
++        let reach: CGFloat = 200
++
++        for row in 0..<height {
++            let y = CGFloat(row) + 0.5
++            let radius = y < halfHeight ? topRadius : bottomRadius
++            let edgeY = min(y, CGFloat(height) - y)
++            let qy = abs(y - halfHeight) - (halfHeight - radius)
++            for column in 0..<width {
++                let x = CGFloat(column) + 0.5
++                let offset = (row * width + column) * 4
++                if edgeY > reach && min(x, CGFloat(width) - x) > reach {
++                    pixels[offset] = 0
++                    pixels[offset + 1] = 0
++                    pixels[offset + 2] = 0
++                    pixels[offset + 3] = 0
++                    continue
++                }
++                let qx = abs(x - halfWidth) - (halfWidth - radius)
++                // Signed distance to the rounded rectangle (negative inside).
++                let outside = (max(qx, 0) * max(qx, 0) + max(qy, 0) * max(qy, 0)).squareRoot()
++                let signed = outside + min(max(qx, qy), 0) - radius
++                let value = UInt8((max(0, min(1, alpha(max(0, -signed)))) * 255).rounded())
++                pixels[offset] = value
++                pixels[offset + 1] = value
++                pixels[offset + 2] = value
++                pixels[offset + 3] = value
++            }
++        }
+         return context.makeImage()
+     }
+ }
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 2eee756..8dc4c8b 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -71,9 +71,6 @@ struct NotchIslandView: View {
+             if phase == .menu {
+                 NotchMenuCard(model: model, onDictate: onTap, onRetry: onRetryLast)
+                     .transition(Self.cardTransition)
+-            } else if phase == .notice {
+-                NotchNoticeCard(onTap: { model.openMenu() })
+-                    .transition(Self.cardTransition)
+             }
+         }
+         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+@@ -105,7 +102,7 @@ struct NotchIslandView: View {
+         switch phase {
+         case .hidden, .idle:
+             return NotchShape(topCornerRadius: 4, bottomCornerRadius: 8)
+-        case .hover, .menu, .notice, .recording, .processing:
++        case .hover, .menu, .recording, .processing:
+             return NotchShape(topCornerRadius: 8, bottomCornerRadius: 14)
+         case .liveText, .assistant:
+             return NotchShape(topCornerRadius: 12, bottomCornerRadius: 22)
+@@ -119,7 +116,7 @@ struct NotchIslandView: View {
+             rimLine(shape: shape, color: NotchIslandGlow.recordingColor.opacity(0.8), fadesOut: fadesOut)
+         case .processing:
+             rimLine(shape: shape, color: NotchIslandGlow.processingColor.opacity(0.6), fadesOut: fadesOut)
+-        case .hidden, .idle, .hover, .menu, .notice, .assistant:
++        case .hidden, .idle, .hover, .menu, .assistant:
+             EmptyView()
+         }
+     }
+@@ -159,7 +156,7 @@ struct NotchIslandView: View {
+         .contentShape(Rectangle())
+         .onTapGesture {
+             switch phase {
+-            case .hidden, .idle, .hover, .notice:
++            case .hidden, .idle, .hover:
+                 model.openMenu()
+             case .menu:
+                 model.closeMenu()
+@@ -175,7 +172,7 @@ struct NotchIslandView: View {
+     private func leftWing(phase: NotchIslandPhase) -> some View {
+         Group {
+             switch phase {
+-            case .hover, .menu, .notice:
++            case .hover, .menu:
+                 Image(systemName: "mic.fill")
+                     .font(.system(size: 11, weight: .semibold))
+                     .foregroundStyle(Color.white.opacity(0.9))
+@@ -213,7 +210,7 @@ struct NotchIslandView: View {
+     private func rightWing(phase: NotchIslandPhase, rowHeight: CGFloat) -> some View {
+         Group {
+             switch phase {
+-            case .hover, .menu, .notice:
++            case .hover, .menu:
+                 Image(systemName: "waveform")
+                     .font(.system(size: 10, weight: .semibold))
+                     .foregroundStyle(Color.white.opacity(0.55))
+@@ -514,35 +511,6 @@ struct NotchMenuCard: View {
+     }
+ }
+ 
+-// MARK: - Notice card (no text field found)
+-
+-struct NotchNoticeCard: View {
+-    let onTap: () -> Void
+-
+-    var body: some View {
+-        HStack(spacing: 10) {
+-            Image(systemName: "doc.on.clipboard.fill")
+-                .font(.system(size: 15, weight: .semibold))
+-                .foregroundStyle(NotchIslandStyle.gold)
+-            VStack(alignment: .leading, spacing: 2) {
+-                Text("No text field found", tableName: "NotchIsland")
+-                    .font(.system(size: 12, weight: .semibold))
+-                    .foregroundStyle(Color.white)
+-                Text("Copied - press ⌘V to paste", tableName: "NotchIsland")
+-                    .font(.system(size: 11))
+-                    .foregroundStyle(Color.white.opacity(0.7))
+-            }
+-            Spacer(minLength: 0)
+-        }
+-        .padding(.horizontal, 16)
+-        .frame(width: NotchIslandModel.noticeCardSize.width, height: NotchIslandModel.noticeCardSize.height)
+-        .notchGlassCard(cornerRadius: 18)
+-        .environment(\.colorScheme, .dark)
+-        .contentShape(Rectangle())
+-        .onTapGesture(perform: onTap)
+-    }
+-}
+-
+ // MARK: - Island outline without the top edge
+ 
+ struct NotchIslandRimShape: Shape {
+@@ -561,7 +529,13 @@ struct NotchIslandRimShape: Shape {
+         let top = topCornerRadius
+         let bottom = bottomCornerRadius
+         var path = Path()
+-        path.move(to: CGPoint(x: rect.minX + top, y: rect.minY + top))
++        // Starts right at the top screen edge (where the screen glow runs) and follows the
++        // island's outward-curved top corner, so both lines meet without a gap.
++        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
++        path.addQuadCurve(
++            to: CGPoint(x: rect.minX + top, y: rect.minY + top),
++            control: CGPoint(x: rect.minX + top, y: rect.minY)
++        )
+         path.addLine(to: CGPoint(x: rect.minX + top, y: rect.maxY - bottom))
+         path.addQuadCurve(
+             to: CGPoint(x: rect.minX + top + bottom, y: rect.maxY),
+@@ -573,6 +547,10 @@ struct NotchIslandRimShape: Shape {
+             control: CGPoint(x: rect.maxX - top, y: rect.maxY)
+         )
+         path.addLine(to: CGPoint(x: rect.maxX - top, y: rect.minY + top))
++        path.addQuadCurve(
++            to: CGPoint(x: rect.maxX, y: rect.minY),
++            control: CGPoint(x: rect.maxX - top, y: rect.minY)
++        )
+         return path
+     }
+ }
+@@ -600,7 +578,7 @@ struct NotchIslandGlow: View {
+                 let pulse = CGFloat((sin(time * 3.2) + 1) / 2)
+                 glow(color: Self.processingColor, strength: 0.32 + 0.25 * pulse, radius: 8 + 4 * pulse)
+             }
+-        case .hidden, .idle, .hover, .menu, .notice, .assistant:
++        case .hidden, .idle, .hover, .menu, .assistant:
+             Color.clear
+         }
+     }
+diff --git a/VoiceInk/Features/Recording/Workflows/TranscriptionDelivery.swift b/VoiceInk/Features/Recording/Workflows/TranscriptionDelivery.swift
+index 8eb73d4..66f7ab7 100644
+--- a/VoiceInk/Features/Recording/Workflows/TranscriptionDelivery.swift
++++ b/VoiceInk/Features/Recording/Workflows/TranscriptionDelivery.swift
+@@ -172,7 +172,6 @@ final class TranscriptionDelivery {
+         SoundManager.shared.playStopSound()
+         await actions.dismiss()
+ 
+-        let targetAcceptsText = PasteTargetCheck.focusedElementAcceptsText()
+         let pasteTask = CursorPaster.startPasteAtCursor(pastedText, sendKey: sendKey)
+ 
+         Task { @MainActor in
+@@ -185,16 +184,6 @@ final class TranscriptionDelivery {
+                 }
+                 CursorPaster.performSendKey(sendKey)
+             }
+-
+-            // No text field took the text: keep it on the clipboard (after any clipboard
+-            // restore) and let the notch say "press ⌘V".
+-            let hasText = !pastedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+-            if hasText && (targetAcceptsText == false || !pasteOutcome.result.didPostPasteCommand) {
+-                await CursorPaster.waitForPendingPasteWork()
+-                if ClipboardManager.copyToClipboard(pastedText) {
+-                    NotificationCenter.default.post(name: .notchPasteTargetMissing, object: nil)
+-                }
+-            }
+         }
+     }
+ 
+diff --git a/VoiceInk/Infrastructure/SystemIntegration/Accessibility/PasteTargetCheck.swift b/VoiceInk/Infrastructure/SystemIntegration/Accessibility/PasteTargetCheck.swift
+deleted file mode 100644
+index 32452bd..0000000
+--- a/VoiceInk/Infrastructure/SystemIntegration/Accessibility/PasteTargetCheck.swift
++++ /dev/null
+@@ -1,55 +0,0 @@
+-import AppKit
+-import ApplicationServices
+-
+-/// Asks Accessibility whether the focused element of the frontmost app can take typed text, so the
+-/// notch can say "copied, press ⌘V" when a dictation had nowhere to go.
+-enum PasteTargetCheck {
+-    /// Roles that never take text input.
+-    private static let nonTextRoles: Set<String> = [
+-        "AXApplication", "AXWindow", "AXList", "AXOutline", "AXTable", "AXBrowser", "AXCell", "AXRow",
+-        "AXButton", "AXImage", "AXScrollArea", "AXSplitGroup", "AXToolbar", "AXTabGroup",
+-        "AXMenuBar", "AXMenu", "AXMenuItem", "AXCheckBox", "AXRadioButton", "AXPopUpButton",
+-        "AXSlider", "AXLink", "AXStaticText", "AXWebArea",
+-    ]
+-
+-    /// true: a text field is focused. false: certainly nothing to type into.
+-    /// nil: unknown (no Accessibility access, or the app does not say), treat as fine.
+-    @MainActor
+-    static func focusedElementAcceptsText() -> Bool? {
+-        guard AXIsProcessTrusted() else { return nil }
+-        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+-
+-        let root = AXUIElementCreateApplication(app.processIdentifier)
+-        // Never wait long on an app that does not answer.
+-        AXUIElementSetMessagingTimeout(root, 0.3)
+-
+-        let read = AccessibilityFocusReader.focusedElement(in: root)
+-        guard let element = read.element else {
+-            // The app answered but nothing has focus (e.g. the desktop in Finder).
+-            return read.error == .noValue ? false : nil
+-        }
+-        AXUIElementSetMessagingTimeout(element, 0.3)
+-
+-        let role = AccessibilityFocusReader.stringAttribute(kAXRoleAttribute as CFString, from: element)
+-        if let editable = AccessibilityFocusReader.editableState(of: element, role: role) {
+-            return editable
+-        }
+-
+-        // Web editors and custom text views: a text selection or a writable value means it takes text.
+-        var range: CFTypeRef?
+-        if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &range) == .success {
+-            return true
+-        }
+-        var settable: DarwinBoolean = false
+-        if AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+-            settable.boolValue
+-        {
+-            return true
+-        }
+-
+-        if let role, nonTextRoles.contains(role) {
+-            return false
+-        }
+-        return nil
+-    }
+-}
+diff --git a/VoiceInk/Infrastructure/SystemIntegration/Paste/CursorPaster.swift b/VoiceInk/Infrastructure/SystemIntegration/Paste/CursorPaster.swift
+index 5803560..efd0d2a 100644
+--- a/VoiceInk/Infrastructure/SystemIntegration/Paste/CursorPaster.swift
++++ b/VoiceInk/Infrastructure/SystemIntegration/Paste/CursorPaster.swift
+@@ -31,12 +31,6 @@ class CursorPaster {
+     private static var pasteQueueTask: Task<Void, Never>?
+     private static let textContextReader = PasteTextContextReader()
+ 
+-    /// Waits until queued pastes and their clipboard restores have finished.
+-    @MainActor
+-    static func waitForPendingPasteWork() async {
+-        await pasteQueueTask?.value
+-    }
+-
+     static func pasteAtCursor(_ text: String) {
+         Task {
+             let pasteTask = await MainActor.run {
+diff --git a/VoiceInk/NotchIsland.xcstrings b/VoiceInk/NotchIsland.xcstrings
+index 645c6df..74c250e 100644
+--- a/VoiceInk/NotchIsland.xcstrings
++++ b/VoiceInk/NotchIsland.xcstrings
+@@ -49,22 +49,6 @@
+         }
+       }
+     },
+-    "Copied - press ⌘V to paste" : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Kopiert – mit ⌘V einfügen"
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Copié – appuyez sur ⌘V pour coller"
+-          }
+-        }
+-      }
+-    },
+     "Copy" : {
+       "localizations" : {
+         "de" : {
+@@ -161,22 +145,6 @@
+         }
+       }
+     },
+-    "No text field found" : {
+-      "localizations" : {
+-        "de" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Kein Textfeld gefunden"
+-          }
+-        },
+-        "fr" : {
+-          "stringUnit" : {
+-            "state" : "translated",
+-            "value" : "Aucun champ de texte trouvé"
+-          }
+-        }
+-      }
+-    },
+     "Nothing dictated yet." : {
+       "localizations" : {
+         "de" : {
