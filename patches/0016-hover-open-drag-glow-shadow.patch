@@ -1,0 +1,259 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift b/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+index 6f9ddaf..9630217 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchFileActions.swift
+@@ -35,2 +35,3 @@ final class NotchFileActions {
+     private var autoDismiss: Task<Void, Never>?
++    private var airDropHost: NotchAirDropHost?
+     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "NotchFileActions")
+@@ -86,4 +87,8 @@ final class NotchFileActions {
+             }
+-            NSApp.activate()
+-            service.perform(withItems: files)
++            // On the desktop you are on, not on the one where a VoiceInk window happens to be.
++            let host = NotchAirDropHost { [weak self] in
++                self?.airDropHost = nil
++            }
++            self.airDropHost = host
++            host.share(files, with: service)
+         }
+@@ -116 +121,59 @@ final class NotchFileActions {
+ }
++
++/// Opens the AirDrop window on the desktop you are working on. Activating VoiceInk would otherwise
++/// jump to the desktop where one of its windows is: a tiny invisible window here prevents that.
++@MainActor
++final class NotchAirDropHost: NSObject, NSSharingServiceDelegate {
++    private let window: NSWindow
++    private let onFinish: () -> Void
++    private var fallback: Task<Void, Never>?
++
++    init(onFinish: @escaping () -> Void) {
++        self.onFinish = onFinish
++        let mouse = NSEvent.mouseLocation
++        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
++        let center = screen.map { NSPoint(x: $0.frame.midX, y: $0.frame.midY) } ?? .zero
++        let host = NSWindow(
++            contentRect: NSRect(x: center.x - 1, y: center.y - 1, width: 2, height: 2),
++            styleMask: [.borderless],
++            backing: .buffered,
++            defer: false
++        )
++        host.isReleasedWhenClosed = false
++        host.backgroundColor = .clear
++        host.isOpaque = false
++        host.hasShadow = false
++        host.ignoresMouseEvents = true
++        host.collectionBehavior = [.moveToActiveSpace, .transient, .ignoresCycle]
++        host.level = .floating
++        window = host
++        super.init()
++    }
++
++    func share(_ files: [URL], with service: NSSharingService) {
++        window.orderFrontRegardless()
++        NSApp.activate()
++        service.delegate = self
++        service.perform(withItems: files)
++        // In case neither "shared" nor "failed" is ever reported.
++        fallback = Task { @MainActor [weak self] in
++            try? await Task.sleep(nanoseconds: 600_000_000_000)
++            self?.finish()
++        }
++    }
++
++    func sharingService(_ sharingService: NSSharingService, didShareItems items: [Any]) {
++        finish()
++    }
++
++    func sharingService(_ sharingService: NSSharingService, didFailToShareItems items: [Any], error: Error) {
++        finish()
++    }
++
++    private func finish() {
++        fallback?.cancel()
++        fallback = nil
++        window.orderOut(nil)
++        onFinish()
++    }
++}
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index e1dc892..f2231ed 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -164,2 +164,5 @@ final class NotchIslandModel: ObservableObject {
+     @Published private(set) var shelfDraggingOut = false
++    /// Closed with a click while the pointer is still on it: do not open again on its own until
++    /// the pointer has left.
++    var suppressHoverOpen = false
+ 
+@@ -310,3 +313,4 @@ final class NotchIslandModel: ObservableObject {
+         case .recording:
+-            return showsLiveTranscript && !partialTranscript.isEmpty ? .liveText : .recording
++            // What you say only shows while the pointer is on the notch; otherwise it keeps its size.
++            return showsLiveTranscript && !partialTranscript.isEmpty && isHovering ? .liveText : .recording
+         case .starting:
+@@ -330,2 +334,8 @@ final class NotchIslandModel: ObservableObject {
+ 
++    /// Resting the pointer on the notch opens it (menu or player) when nothing else is going on.
++    var canOpenOnHover: Bool {
++        !menuOpen && !suppressHoverOpen && fileDrag == nil && fileTask == nil && shelfItems.isEmpty
++            && !shelfDraggingOut && !assistantVisible && recordingState == .idle
++    }
++
+     /// Just wide enough for the parked files (up to four side by side, more scroll).
+@@ -619,2 +629,3 @@ final class NotchIslandController {
+     private var hoverExitTask: Task<Void, Never>?
++    private var hoverOpenTask: Task<Void, Never>?
+     private var menuCloseTask: Task<Void, Never>?
+@@ -941,2 +952,3 @@ final class NotchIslandController {
+             }
++            scheduleHoverOpen()
+             return
+@@ -944,2 +956,8 @@ final class NotchIslandController {
+ 
++        hoverOpenTask?.cancel()
++        hoverOpenTask = nil
++        if model.suppressHoverOpen {
++            model.suppressHoverOpen = false
++        }
++
+         if model.isHovering, hoverExitTask == nil {
+@@ -968,2 +986,15 @@ final class NotchIslandController {
+ 
++    /// Opens the notch by itself once the pointer rests on it for a moment, no click needed.
++    private func scheduleHoverOpen() {
++        guard hoverOpenTask == nil, model.canOpenOnHover else { return }
++        hoverOpenTask = Task { @MainActor [weak self] in
++            try? await Task.sleep(nanoseconds: 160_000_000)
++            guard let self, !Task.isCancelled else { return }
++            self.hoverOpenTask = nil
++            if self.model.canOpenOnHover, self.model.containsPointer(NSEvent.mouseLocation) {
++                self.model.openMenu()
++            }
++        }
++    }
++
+     private func modelDidChange() {
+@@ -982,4 +1013,6 @@ final class NotchIslandController {
+         let phase = model.phase
++        let dictating = model.sessionActive && phase.showsScreenGlow
++        // While a file is dragged, the top around the notch lights up a little.
+         let wantsGlow = NotchIslandSettings.screenGlowEnabled && NotchScreenGlowWindow.isSupported
+-            && model.sessionActive && phase.showsScreenGlow
++            && (dictating || phase.isFileDrop)
+         if wantsGlow, let screen = NSScreen.screens.first(where: { $0.frame == model.geometry.screenFrame }) {
+@@ -987,3 +1020,7 @@ final class NotchIslandController {
+             screenGlow.show(on: screen, meter: { [recorder] in recorder.audioMeterSnapshot() })
+-            screenGlow.setMode(phase == .processing ? .processing : .speaking)
++            if phase == .processing {
++                screenGlow.setMode(.processing)
++            } else {
++                screenGlow.setMode(dictating ? .speaking : .invite)
++            }
+         } else {
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index f7f0e63..9e5fa3e 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -27,2 +27,4 @@ final class NotchScreenGlowWindow {
+         case processing
++        /// A file is being dragged: only the top around the island lights up, breathing gently.
++        case invite
+     }
+@@ -67,2 +69,3 @@ final class NotchScreenGlowWindow {
+     private var processing = NotchGlowTween()
++    private var focus = NotchGlowTween()
+     private var islandWidth = NotchGlowTween()
+@@ -122,5 +125,16 @@ final class NotchScreenGlowWindow {
+     func setMode(_ newMode: Mode) {
+-        guard newMode != mode else { return }
++        let now = CACurrentMediaTime()
++        // Just appearing: start in this mode right away instead of morphing into it.
++        let appearing = opacity.value(at: now) < 0.05
++        guard newMode != mode || appearing else { return }
+         mode = newMode
+-        processing.retarget(newMode == .processing ? 1 : 0, duration: Self.modeDuration, at: CACurrentMediaTime())
++        let processingTarget: Double = newMode == .processing ? 1 : 0
++        let focusTarget: Double = newMode == .invite ? 1 : 0
++        if appearing {
++            processing.jump(to: processingTarget)
++            focus.jump(to: focusTarget)
++        } else {
++            processing.retarget(processingTarget, duration: Self.modeDuration, at: now)
++            focus.retarget(focusTarget, duration: Self.modeDuration, at: now)
++        }
+     }
+@@ -271,3 +285,4 @@ final class NotchScreenGlowWindow {
+             screenRadius: Self.screenRadius,
+-            bottomScreenRadius: Self.bottomScreenRadius
++            bottomScreenRadius: Self.bottomScreenRadius,
++            focus: Float(focus.value(at: time))
+         )
+@@ -404,2 +419,4 @@ struct NotchGlowUniforms {
+     var bottomScreenRadius: Float
++    /// 0: the whole screen edge, 1: only the top around the island.
++    var focus: Float
+ }
+@@ -457,2 +474,3 @@ enum NotchGlowShader {
+             float bottomScreenRadius;
++            float focus;
+         };
+@@ -552,3 +570,5 @@ enum NotchGlowShader {
+             // The voice makes all three bigger.
+-            float level = clamp(u.level, 0.0f, 1.0f);
++            // Waiting for a dropped file: a gentle breath instead of the voice.
++            float breath = u.focus * (0.12f + 0.12f * sin(u.time * 6.2831853f / 2.2f));
++            float level = clamp(max(u.level, breath), 0.0f, 1.0f);
+             float lineWidth = mix(2.4f, 7.0f, level);
+@@ -561,2 +581,5 @@ enum NotchGlowShader {
+             strength *= clamp(u.opacity, 0.0f, 1.0f) * coverage;
++            // Waiting for a dropped file: only the top around the island, fading out along the edge.
++            float2 outside = float2(max(abs(p.x - center.x) - islandHalf, 0.0f), max(p.y - u.islandHeight, 0.0f));
++            strength *= mix(1.0f, exp(-length(outside) / 110.0f), clamp(u.focus, 0.0f, 1.0f));
+ 
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 387f200..c77cb28 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -77,7 +77,9 @@ struct NotchIslandView: View {
+         // The screen-edge glow (its own window) is on: the island's outline joins that line.
+-        let joinsScreenGlow = screenGlowEnabled && NotchScreenGlowWindow.isSupported
+-            && model.sessionActive && phase.showsScreenGlow
++        let glowAvailable = screenGlowEnabled && NotchScreenGlowWindow.isSupported
++        let joinsScreenGlow = glowAvailable && model.sessionActive && phase.showsScreenGlow
++        // The screen glow runs around the island: while dictating, and while a file is dragged.
++        let glowAround = joinsScreenGlow || (glowAvailable && phase.isFileDrop)
+ 
+         VStack(spacing: NotchIslandModel.cardGap) {
+-            island(phase: phase, size: size, shape: shape, joinsScreenGlow: joinsScreenGlow)
++            island(phase: phase, size: size, shape: shape, joinsScreenGlow: joinsScreenGlow, glowAround: glowAround)
+ 
+@@ -101,6 +103,15 @@ struct NotchIslandView: View {
+ 
+-    private func island(phase: NotchIslandPhase, size: CGSize, shape: NotchIslandShape, joinsScreenGlow: Bool) -> some View {
++    private func island(
++        phase: NotchIslandPhase,
++        size: CGSize,
++        shape: NotchIslandShape,
++        joinsScreenGlow: Bool,
++        glowAround: Bool
++    ) -> some View {
+         // The island draws its own gold outline when the screen glow does not.
+         let ownOutline = phase.showsScreenGlow && !joinsScreenGlow
+-        let shoulder = model.geometry.hasNotch && phase.hasShoulders ? NotchIslandStyle.shoulderRadius : 0
++        // The glow line follows the island itself, so no roundings into the strip beside it then.
++        let shoulder = model.geometry.hasNotch && phase.hasShoulders && !glowAround ? NotchIslandStyle.shoulderRadius : 0
++        // Without light around it, a soft dark shadow sets the opened island off from what is behind.
++        let shadowed = !glowAround && !ownOutline && phase != .hidden && phase != .idle
+         // Not while the screen glow runs around the island: that line would not follow.
+@@ -144,2 +155,4 @@ struct NotchIslandView: View {
+         }
++        .compositingGroup()
++        .shadow(color: Color.black.opacity(shadowed ? 0.55 : 0), radius: 14, x: 0, y: 5)
+         .scaleEffect(pressScale, anchor: .top)
+@@ -229,2 +242,4 @@ struct NotchIslandView: View {
+         case .menu, .player:
++            // Stays closed while the pointer is still on it.
++            model.suppressHoverOpen = true
+             model.closeMenu()
