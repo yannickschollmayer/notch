@@ -1,0 +1,173 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index 5d548f3..5d174cb 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -17,7 +17,8 @@ struct NotchGlowIsland: Equatable {
+ /// Every frame the shader works out how far each pixel is from the lit edge: the screen border and
+ /// the island's sides and bottom. The island outline is animated here with the same curve and
+ /// duration the island itself uses, so the line always grows and shrinks together with the island.
+-/// The voice makes the line thicker and lets the shimmer reach further.
++/// The voice makes the line clearly thicker and lets the glow reach further. Gold with a stretch
++/// of PromoPulse blue that wanders around the screen.
+ @MainActor
+ final class NotchScreenGlowWindow {
+     enum Mode {
+@@ -39,8 +40,12 @@ final class NotchScreenGlowWindow {
+     static let islandDuration: CFTimeInterval = 0.42
+     private static let fadeDuration: CFTimeInterval = 0.35
+     private static let modeDuration: CFTimeInterval = 0.45
+-    /// Inner rounding of the line in the screen corners (the outer corner is filled).
++    /// Top corners: inner rounding of the line (the display rounds the outer corner itself).
+     private static let screenRadius: Float = 18
++    /// Bottom corners: the line runs round, close to the corner.
++    private static let bottomScreenRadius: Float = 10
++    /// The colours repeat after this many seconds (7, 10, 11 and 1.75 s all fit into it).
++    private static let colorPeriod: Double = 770
+ 
+     private var panel: NSPanel?
+     private var metalLayer: CAMetalLayer?
+@@ -254,7 +259,7 @@ final class NotchScreenGlowWindow {
+             width: Float(size.width),
+             height: Float(size.height),
+             scale: Float(drawable.texture.width) / Float(size.width),
+-            time: Float(fmod(now - epoch, 70)),
++            time: Float(fmod(now - epoch, Self.colorPeriod)),
+             opacity: Float(opacity.value(at: time)),
+             level: Float(level),
+             processing: Float(processing.value(at: time)),
+@@ -262,7 +267,8 @@ final class NotchScreenGlowWindow {
+             islandHeight: Float(islandHeight.value(at: time)),
+             islandTopRadius: Float(islandTop.value(at: time)),
+             islandBottomRadius: Float(islandBottom.value(at: time)),
+-            screenRadius: Self.screenRadius
++            screenRadius: Self.screenRadius,
++            bottomScreenRadius: Self.bottomScreenRadius
+         )
+ 
+         let pass = MTLRenderPassDescriptor()
+@@ -295,10 +301,13 @@ final class NotchScreenGlowWindow {
+     private func updateLevel(delta: CFTimeInterval) {
+         var target: Double = 0
+         if isShown, mode == .speaking, let meter {
+-            target = max(0, min(1, pow(meter().averagePower, 0.6)))
++            // Room noise sits around -45 dB and speech around -30 to -20 dB (0...1 = -60...0 dB):
++            // silence keeps the thin line, every word makes it visibly thicker.
++            let speech = (meter().averagePower - 0.25) / 0.35
++            target = max(0, min(1, speech))
+         }
+-        // Quick to rise, slower to fall (rates per 1/30 s).
+-        let rate = target > level ? 0.55 : 0.15
++        // Quick to rise, a little slower to fall (rates per 1/30 s), so it follows the words.
++        let rate = target > level ? 0.6 : 0.2
+         let factor = 1 - pow(1 - rate, delta * 30)
+         level += (target - level) * factor
+     }
+@@ -391,6 +400,7 @@ struct NotchGlowUniforms {
+     var islandTopRadius: Float
+     var islandBottomRadius: Float
+     var screenRadius: Float
++    var bottomScreenRadius: Float
+ }
+ 
+ /// Compiles the glow shader once. nil when Metal is not available or compiling failed (the
+@@ -443,6 +453,7 @@ enum NotchGlowShader {
+             float islandTopRadius;
+             float islandBottomRadius;
+             float screenRadius;
++            float bottomScreenRadius;
+         };
+ 
+         struct NotchGlowVertexOut {
+@@ -455,6 +466,10 @@ enum NotchGlowShader {
+             float3(1.000f, 0.761f, 0.102f)
+         };
+ 
++        // PromoPulse navy (hue 222) as light: bright enough to glow on the screen edge.
++        constant float3 promoBlue = float3(0.184f, 0.384f, 0.855f);
++        constant float3 promoBlueDeep = float3(0.122f, 0.271f, 0.690f);
++
+         constant float3 silverStops[7] = {
+             float3(1.000f, 1.000f, 1.000f), float3(0.851f, 0.867f, 0.894f), float3(0.710f, 0.737f, 0.784f),
+             float3(0.992f, 0.792f, 0.247f), float3(0.851f, 0.867f, 0.894f), float3(0.710f, 0.737f, 0.784f),
+@@ -503,9 +518,11 @@ enum NotchGlowShader {
+                 return float4(0.0f);
+             }
+ 
+-            // Lit edge: inside the screen (outer corners filled, inner side rounded) and outside
+-            // the island, joined by the island's outward curve at the top.
+-            float dScreen = roundedBox(p - center, center, u.screenRadius);
++            // Lit edge: inside the screen and outside the island, joined by the island's outward
++            // curve at the top. Top corners are filled (the display rounds them itself), bottom
++            // corners run round, close to the corner.
++            bool lower = p.y > center.y;
++            float dScreen = roundedBox(p - center, center, lower ? u.bottomScreenRadius : u.screenRadius);
+             float top = min(u.islandTopRadius, min(islandHalf, u.islandHeight));
+             float halfWidth = max(islandHalf - top, 0.0f);
+             float bottom = min(u.islandBottomRadius, min(halfWidth, max(u.islandHeight - top, 0.0f)));
+@@ -516,6 +533,10 @@ enum NotchGlowShader {
+                 d = roundIntersect(dScreen, -dIsland, top);
+             }
+             float e = max(-d, 0.0f);
++            float coverage = 1.0f;
++            if (lower && dScreen > 0.0f) {
++                coverage = clamp(0.5f - dScreen * u.scale, 0.0f, 1.0f);
++            }
+ 
+             // The shimmer uses a soft minimum of the distances, so it stays smooth in every corner.
+             float4 edges = max(float4(p.y, size.y - p.y, p.x, size.x - p.x), float4(0.05f));
+@@ -526,26 +547,41 @@ enum NotchGlowShader {
+             float total = inv.x + inv.y + inv.z + inv.w + islandInverse * islandInverse;
+             float glowDistance = rsqrt(sqrt(total));
+ 
++            // Line, a soft halo right next to it (so it melts into the shimmer), and the shimmer.
++            // The voice makes all three bigger.
+             float level = clamp(u.level, 0.0f, 1.0f);
+-            float lineWidth = mix(2.4f, 5.4f, level);
+-            float soft = mix(1.2f, 2.2f, level);
+-            float line = 1.0f - smoothstep(lineWidth, lineWidth + soft, e);
+-            float strength = mix(0.28f, 0.36f, level);
+-            float reach = mix(15.0f, 25.0f, level);
+-            float shimmer = strength * exp(-pow(glowDistance / reach, 1.5f));
+-            float alpha = line + shimmer * (1.0f - line);
++            float lineWidth = mix(2.4f, 7.0f, level);
++            float core = 1.0f - smoothstep(lineWidth, lineWidth + mix(1.0f, 2.0f, level), e);
++            float bloom = mix(0.55f, 0.75f, level) * exp(-max(e - lineWidth, 0.0f) / mix(3.5f, 6.5f, level));
++            float shimmer = mix(0.26f, 0.38f, level) * exp(-pow(glowDistance / mix(16.0f, 28.0f, level), 1.5f));
+ 
+             float pulse = 0.5f + 0.5f * sin(u.time * 6.2831853f / 1.75f);
+-            alpha *= mix(1.0f, 0.45f + 0.5f * pulse, u.processing);
+-            alpha *= clamp(u.opacity, 0.0f, 1.0f);
++            float strength = mix(1.0f, 0.45f + 0.5f * pulse, u.processing);
++            strength *= clamp(u.opacity, 0.0f, 1.0f) * coverage;
+ 
++            // Gold turning around the screen, with a stretch of PromoPulse blue wandering along it.
++            // Between the two the light turns warm white instead of grey. The shimmer leans a
++            // little further towards blue.
+             float2 fromCenter = p - center;
+             float angle = atan2(fromCenter.x, -fromCenter.y) / 6.2831853f;
+-            float3 forward = rampColor(goldStops, angle + u.time / 7.0f);
+-            float3 backward = rampColor(goldStops, -angle + u.time / 10.0f);
+-            float3 color = mix(forward, backward, 0.35f * level);
+-            color = mix(color, rampColor(silverStops, angle + u.time / 7.0f), u.processing);
+-            return float4(color * alpha, alpha);
++            float3 gold = mix(
++                rampColor(goldStops, angle + u.time / 7.0f),
++                rampColor(goldStops, -angle + u.time / 10.0f),
++                0.35f * level
++            );
++            float stretch = fract(angle + u.time / 11.0f);
++            float blueWeight = smoothstep(0.0f, 0.10f, stretch) * (1.0f - smoothstep(0.18f, 0.30f, stretch));
++            float3 lineColor = mix(gold, promoBlue, blueWeight);
++            float brightest = max(max(lineColor.x, lineColor.y), lineColor.z);
++            lineColor /= mix(1.0f, brightest, 3.4f * blueWeight * (1.0f - blueWeight));
++            lineColor = mix(lineColor, rampColor(silverStops, angle + u.time / 7.0f), u.processing);
++            float hazeBlue = 0.55f * smoothstep(4.0f, 30.0f, glowDistance) * (1.0f - u.processing);
++            float3 hazeColor = mix(lineColor, promoBlueDeep, hazeBlue);
++
++            float lit = core + (1.0f - core) * bloom;
++            float3 rgb = lit * lineColor + (1.0f - core) * (1.0f - bloom) * shimmer * hazeColor;
++            float alpha = 1.0f - (1.0f - core) * (1.0f - bloom) * (1.0f - shimmer);
++            return float4(rgb * strength, alpha * strength);
+         }
+         """
+ }
