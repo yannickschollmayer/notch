@@ -1,0 +1,713 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index e76201f..7b93d8e 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -430,7 +430,7 @@ final class NotchIslandController {
+         guard let screen = model.sessionActive ? RecorderScreenResolver.resolve() : NotchIslandController.idleScreen() else { return }
+         place(on: screen)
+         installEventMonitors()
+-        screenGlow.prepare(for: screen)
++        screenGlow.prepare(for: screen, islands: [glowIsland(for: .recording), glowIsland(for: .liveText)])
+     }
+ 
+     /// A dictation started: move to the screen being worked on and expand.
+@@ -660,5 +660,18 @@ final class NotchIslandController {
+         }
+         screenGlow.show(on: screen, meter: { [recorder] in recorder.audioMeterSnapshot() })
+         screenGlow.setMode(phase == .processing ? .processing : .speaking)
++        screenGlow.setIsland(glowIsland(for: phase))
++    }
++
++    /// The island outline the screen glow runs around in a phase.
++    private func glowIsland(for phase: NotchIslandPhase) -> NotchGlowIsland {
++        let size = model.size(for: phase)
++        let shape = NotchIslandView.shape(for: phase)
++        return NotchGlowIsland(
++            width: size.width,
++            height: size.height,
++            topRadius: shape.topCornerRadius,
++            bottomRadius: shape.bottomCornerRadius
++        )
+     }
+ }
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+index 4e16b66..2c9ae2c 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchScreenGlowWindow.swift
+@@ -1,11 +1,25 @@
+ import AppKit
+ import QuartzCore
+ 
++/// Outline of the island the glow wraps around, in points. The island sits centred at the top
++/// edge of the screen.
++struct NotchGlowIsland: Hashable {
++    var width: CGFloat
++    var height: CGFloat
++    var topRadius: CGFloat
++    var bottomRadius: CGFloat
++}
++
+ /// Siri-style light along the screen edges while dictating.
+ ///
+-/// Drawn entirely with Core Animation: the soft edge masks are rendered once per screen size and
+-/// the colours turn via a layer animation on the GPU, so nothing is redrawn on the main thread.
+-/// The only per-frame work is setting two layer opacities from the microphone level.
++/// Drawn entirely with Core Animation: the edge masks are rendered once per screen and island
++/// size, and the colours turn via a layer animation on the GPU, so nothing is redrawn on the main
++/// thread. The voice only changes layer opacities: a strong line along the edge that gets thicker
++/// while you speak, with a light shimmer inwards.
++///
++/// While dictating the line also runs around the island. That outline fades in only after the
++/// island has finished growing, and disappears at once when the island changes or shrinks, so the
++/// two never drift apart.
+ @MainActor
+ final class NotchScreenGlowWindow {
+     enum Mode {
+@@ -13,32 +27,44 @@ final class NotchScreenGlowWindow {
+         case processing
+     }
+ 
++    private enum MaskKind: String {
++        /// Strong line at the edge plus a light shimmer.
++        case base
++        /// Thicker line that is faded in with the voice.
++        case swell
++    }
++
+     private var panel: NSPanel?
+     private var screenFrame: NSRect = .zero
++    private var screenSize: CGSize = .zero
+     private var isShown = false
+     private var mode: Mode?
++    private var island: NotchGlowIsland?
++    private var islandTask: Task<Void, Never>?
++    private var hideTask: Task<Void, Never>?
+ 
+     private let container = CALayer()
+-    private let baseGlow = CALayer()
+-    private let swellGlow = CALayer()
+-    private let baseMask = CALayer()
+-    private let swellMask = CALayer()
+-    private let baseGradient = CAGradientLayer()
+-    private let swellGradient = CAGradientLayer()
++    /// Edges only (used while the island is changing size).
++    private let edgeGroup = CALayer()
++    /// Edges plus the line around the island.
++    private let dipGroup = CALayer()
++    private let edgeBase = GlowLayer()
++    private let edgeSwell = GlowLayer()
++    private let dipBase = GlowLayer()
++    private let dipSwell = GlowLayer()
+ 
+     private var meter: (() -> AudioMeter)?
+     private var levelTimer: Timer?
+     private var smoothedLevel: Double = 0
+-    private var hideTask: Task<Void, Never>?
+ 
+-    private static var maskCache: [String: (base: CGImage, swell: CGImage)] = [:]
++    private static var maskCache: [String: CGImage] = [:]
+     private static let easing = CAMediaTimingFunction(controlPoints: 0.4, 0, 0.2, 1)
+ 
+     private static let speakingColors: [CGColor] = [
+-        0xFFE08A, 0xFDCA3F, 0xFCA311, 0xF59E0B, 0xFFD978, 0xFFF1C2, 0xFDCA3F, 0xFFE08A,
++        0xFFC21A, 0xF7A400, 0xFFD23F, 0xF08C00, 0xFDCA3F, 0xFFB000, 0xFFC21A,
+     ].map(color)
+     private static let processingColors: [CGColor] = [
+-        0xFFFFFF, 0xE7E9EE, 0xB5BCC8, 0xFFE08A, 0xE7E9EE, 0xB5BCC8, 0xE7E9EE, 0xFFFFFF,
++        0xFFFFFF, 0xD9DDE4, 0xB5BCC8, 0xFDCA3F, 0xD9DDE4, 0xB5BCC8, 0xFFFFFF,
+     ].map(color)
+ 
+     private static func color(_ hex: Int) -> CGColor {
+@@ -50,32 +76,69 @@ final class NotchScreenGlowWindow {
+         )
+     }
+ 
+-    init() {
+-        container.opacity = 0
+-        for (glow, mask, gradient) in [(baseGlow, baseMask, baseGradient), (swellGlow, swellMask, swellGradient)] {
++    /// A spinning conic gradient seen through a mask.
++    private final class GlowLayer {
++        let glow = CALayer()
++        let mask = CALayer()
++        let gradient = CAGradientLayer()
++
++        init() {
+             gradient.type = .conic
+             gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
+             gradient.endPoint = CGPoint(x: 0.5, y: 0)
+-            gradient.colors = Self.speakingColors
+             glow.addSublayer(gradient)
+             glow.mask = mask
+-            container.addSublayer(glow)
+         }
+-        swellGlow.opacity = 0
++    }
++
++    private var allGlows: [GlowLayer] { [edgeBase, edgeSwell, dipBase, dipSwell] }
++    private var swells: [GlowLayer] { [edgeSwell, dipSwell] }
++    private var bases: [GlowLayer] { [edgeBase, dipBase] }
++
++    init() {
++        container.opacity = 0
++        dipGroup.opacity = 0
++        edgeGroup.addSublayer(edgeBase.glow)
++        edgeGroup.addSublayer(edgeSwell.glow)
++        dipGroup.addSublayer(dipBase.glow)
++        dipGroup.addSublayer(dipSwell.glow)
++        container.addSublayer(edgeGroup)
++        container.addSublayer(dipGroup)
++        for layer in allGlows {
++            layer.gradient.colors = Self.speakingColors
++        }
++        for layer in swells {
++            layer.glow.opacity = 0
++        }
+     }
+ 
+     // MARK: Public API
+ 
+-    /// Renders the edge masks in the background so the first dictation starts without a hitch.
+-    func prepare(for screen: NSScreen) {
++    /// Renders the masks in the background so the first dictation starts without a hitch.
++    func prepare(for screen: NSScreen, islands: [NotchGlowIsland]) {
+         let size = screen.frame.size
+-        let key = Self.cacheKey(for: size)
+-        guard Self.maskCache[key] == nil else { return }
++        var jobs: [(key: String, island: NotchGlowIsland?, kind: MaskKind)] = []
++        for kind in [MaskKind.base, .swell] {
++            jobs.append((Self.cacheKey(size: size, island: nil, kind: kind), nil, kind))
++            for island in islands {
++                jobs.append((Self.cacheKey(size: size, island: island, kind: kind), island, kind))
++            }
++        }
++        jobs = jobs.filter { Self.maskCache[$0.key] == nil }
++        guard !jobs.isEmpty else { return }
++
+         DispatchQueue.global(qos: .utility).async {
+-            guard let masks = NotchScreenGlowWindow.renderMasks(size: size) else { return }
++            var results: [(String, CGImage)] = []
++            for job in jobs {
++                if let image = NotchScreenGlowWindow.renderMask(size: size, island: job.island, kind: job.kind) {
++                    results.append((job.key, image))
++                }
++            }
+             DispatchQueue.main.async {
+                 MainActor.assumeIsolated {
+-                    NotchScreenGlowWindow.maskCache[key] = masks
++                    for (key, image) in results {
++                        NotchScreenGlowWindow.maskCache[key] = image
++                    }
+                 }
+             }
+         }
+@@ -90,8 +153,10 @@ final class NotchScreenGlowWindow {
+         let panel = ensurePanel()
+         if screenFrame != screen.frame {
+             screenFrame = screen.frame
++            screenSize = screen.frame.size
+             panel.setFrame(screen.frame, display: false)
+-            layout(size: screen.frame.size)
++            layout()
++            island = nil
+         }
+ 
+         guard !isShown else { return }
+@@ -102,35 +167,82 @@ final class NotchScreenGlowWindow {
+         startLevelTimer()
+     }
+ 
++    /// The island the line should run around (nil: edges only). The outline leaves at once and
++    /// comes back once the island has settled at its new size.
++    func setIsland(_ newIsland: NotchGlowIsland?) {
++        guard newIsland != island else { return }
++        island = newIsland
++        islandTask?.cancel()
++        islandTask = nil
++        showOutline(false, duration: 0.12)
++
++        guard let newIsland, screenSize != .zero else { return }
++        let size = screenSize
++        islandTask = Task { @MainActor [weak self] in
++            // The island grows in 0.42 s; the outline must not show up ahead of it.
++            try? await Task.sleep(nanoseconds: 400_000_000)
++            guard !Task.isCancelled else { return }
++
++            var masks: [MaskKind: CGImage] = [:]
++            for kind in [MaskKind.base, .swell] {
++                let key = NotchScreenGlowWindow.cacheKey(size: size, island: newIsland, kind: kind)
++                if let cached = NotchScreenGlowWindow.maskCache[key] {
++                    masks[kind] = cached
++                } else if let image = await Task.detached(priority: .userInitiated, operation: {
++                    NotchScreenGlowWindow.renderMask(size: size, island: newIsland, kind: kind)
++                }).value {
++                    NotchScreenGlowWindow.maskCache[key] = image
++                    masks[kind] = image
++                }
++            }
++
++            guard let self, !Task.isCancelled, self.island == newIsland,
++                let base = masks[.base], let swell = masks[.swell]
++            else { return }
++            CATransaction.begin()
++            CATransaction.setDisableActions(true)
++            self.dipBase.mask.contents = base
++            self.dipSwell.mask.contents = swell
++            CATransaction.commit()
++            self.showOutline(true, duration: 0.25)
++        }
++    }
++
+     func setMode(_ newMode: Mode) {
+         guard newMode != mode else { return }
+         mode = newMode
+         let colors = newMode == .speaking ? Self.speakingColors : Self.processingColors
+ 
+-        for gradient in [baseGradient, swellGradient] {
++        for layer in allGlows {
+             let change = CABasicAnimation(keyPath: "colors")
+-            change.fromValue = gradient.presentation()?.colors ?? gradient.colors
++            change.fromValue = layer.gradient.presentation()?.colors ?? layer.gradient.colors
+             change.toValue = colors
+             change.duration = 0.45
+             change.timingFunction = Self.easing
+-            gradient.colors = colors
+-            gradient.add(change, forKey: "colors")
++            layer.gradient.colors = colors
++            layer.gradient.add(change, forKey: "colors")
+         }
+ 
+         switch newMode {
+         case .speaking:
+-            baseGlow.removeAnimation(forKey: "pulse")
+-            animate(baseGlow, to: 0.8, duration: 0.3)
++            for layer in bases {
++                layer.glow.removeAnimation(forKey: "pulse")
++                animate(layer.glow, to: 1, duration: 0.3)
++            }
+         case .processing:
+-            animate(swellGlow, to: 0, duration: 0.3)
+-            let pulse = CABasicAnimation(keyPath: "opacity")
+-            pulse.fromValue = 0.35
+-            pulse.toValue = 0.85
+-            pulse.duration = 0.9
+-            pulse.autoreverses = true
+-            pulse.repeatCount = .infinity
+-            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+-            baseGlow.add(pulse, forKey: "pulse")
++            for layer in swells {
++                animate(layer.glow, to: 0, duration: 0.3)
++            }
++            for layer in bases {
++                let pulse = CABasicAnimation(keyPath: "opacity")
++                pulse.fromValue = 0.45
++                pulse.toValue = 0.95
++                pulse.duration = 0.9
++                pulse.autoreverses = true
++                pulse.repeatCount = .infinity
++                pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
++                layer.glow.add(pulse, forKey: "pulse")
++            }
+         }
+     }
+ 
+@@ -138,16 +250,24 @@ final class NotchScreenGlowWindow {
+         guard isShown else { return }
+         isShown = false
+         mode = nil
++        island = nil
++        islandTask?.cancel()
++        islandTask = nil
+         stopLevelTimer()
+-        animate(container, to: 0, duration: 0.45)
++        // The outline goes first, together with the shrinking island; then everything fades.
++        showOutline(false, duration: 0.12)
++        animate(container, to: 0, duration: 0.35)
+         hideTask = Task { @MainActor [weak self] in
+-            try? await Task.sleep(nanoseconds: 500_000_000)
++            try? await Task.sleep(nanoseconds: 450_000_000)
+             guard let self, !Task.isCancelled else { return }
+             self.panel?.orderOut(nil)
+-            self.baseGlow.removeAllAnimations()
+-            self.baseGradient.removeAnimation(forKey: "spin")
+-            self.swellGradient.removeAnimation(forKey: "spin")
+-            self.swellGlow.opacity = 0
++            for layer in self.allGlows {
++                layer.glow.removeAllAnimations()
++                layer.gradient.removeAnimation(forKey: "spin")
++            }
++            for layer in self.swells {
++                layer.glow.opacity = 0
++            }
+             self.smoothedLevel = 0
+         }
+     }
+@@ -155,11 +275,13 @@ final class NotchScreenGlowWindow {
+     func destroy() {
+         stopLevelTimer()
+         hideTask?.cancel()
++        islandTask?.cancel()
+         panel?.orderOut(nil)
+         panel?.close()
+         panel = nil
+         isShown = false
+         mode = nil
++        island = nil
+     }
+ 
+     // MARK: Window and layers
+@@ -194,41 +316,47 @@ final class NotchScreenGlowWindow {
+         return newPanel
+     }
+ 
+-    private func layout(size: CGSize) {
++    private func layout() {
+         CATransaction.begin()
+         CATransaction.setDisableActions(true)
+ 
++        let size = screenSize
+         let bounds = CGRect(origin: .zero, size: size)
+         container.frame = bounds
++        edgeGroup.frame = bounds
++        dipGroup.frame = bounds
+         // The gradients spin, so they must cover the screen at every angle.
+         let diagonal = (size.width * size.width + size.height * size.height).squareRoot()
+-        for (glow, mask, gradient) in [(baseGlow, baseMask, baseGradient), (swellGlow, swellMask, swellGradient)] {
+-            glow.frame = bounds
+-            mask.frame = bounds
+-            gradient.bounds = CGRect(x: 0, y: 0, width: diagonal, height: diagonal)
+-            gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
++        for layer in allGlows {
++            layer.glow.frame = bounds
++            layer.mask.frame = bounds
++            layer.gradient.bounds = CGRect(x: 0, y: 0, width: diagonal, height: diagonal)
++            layer.gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
+         }
+ 
+-        let key = Self.cacheKey(for: size)
+-        let masks = Self.maskCache[key] ?? Self.renderMasks(size: size)
+-        if let masks {
+-            Self.maskCache[key] = masks
+-            baseMask.contents = masks.base
+-            swellMask.contents = masks.swell
+-        }
++        edgeBase.mask.contents = Self.mask(size: size, island: nil, kind: .base)
++        edgeSwell.mask.contents = Self.mask(size: size, island: nil, kind: .swell)
++        dipGroup.opacity = 0
++        edgeGroup.opacity = 1
+ 
+         CATransaction.commit()
+     }
+ 
++    private func showOutline(_ visible: Bool, duration: CFTimeInterval) {
++        animate(dipGroup, to: visible ? 1 : 0, duration: duration)
++        animate(edgeGroup, to: visible ? 0 : 1, duration: duration)
++    }
++
+     private func startSpinning() {
+-        for (gradient, turn, duration) in [(baseGradient, 2 * Double.pi, 7.0), (swellGradient, -2 * Double.pi, 10.0)] {
+-            guard gradient.animation(forKey: "spin") == nil else { continue }
++        for (index, layer) in allGlows.enumerated() {
++            guard layer.gradient.animation(forKey: "spin") == nil else { continue }
+             let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+             spin.fromValue = 0
+-            spin.toValue = turn
+-            spin.duration = duration
++            // The swell turns the other way, which keeps the colours moving like Siri's light.
++            spin.toValue = index % 2 == 0 ? 2 * Double.pi : -2 * Double.pi
++            spin.duration = index % 2 == 0 ? 7 : 10
+             spin.repeatCount = .infinity
+-            gradient.add(spin, forKey: "spin")
++            layer.gradient.add(spin, forKey: "spin")
+         }
+     }
+ 
+@@ -260,44 +388,60 @@ final class NotchScreenGlowWindow {
+ 
+     private func updateLevel() {
+         guard mode == .speaking, let meter else { return }
+-        let target = max(0, min(1, pow(meter().averagePower, 0.7)))
+-        let rate = target > smoothedLevel ? 0.5 : 0.15
++        let target = max(0, min(1, pow(meter().averagePower, 0.6)))
++        let rate = target > smoothedLevel ? 0.55 : 0.15
+         smoothedLevel += (target - smoothedLevel) * rate
+ 
+         CATransaction.begin()
+         CATransaction.setAnimationDuration(1.0 / 30.0)
+         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+-        baseGlow.opacity = Float(0.75 + 0.25 * smoothedLevel)
+-        swellGlow.opacity = Float(0.1 + 0.9 * smoothedLevel)
++        for layer in swells {
++            layer.glow.opacity = Float(smoothedLevel)
++        }
+         CATransaction.commit()
+     }
+ 
+     // MARK: Masks
+ 
+-    private static func cacheKey(for size: CGSize) -> String {
+-        "\(Int(size.width))x\(Int(size.height))"
++    private static func cacheKey(size: CGSize, island: NotchGlowIsland?, kind: MaskKind) -> String {
++        var key = "\(kind.rawValue)-\(Int(size.width))x\(Int(size.height))"
++        if let island {
++            key += "-\(Int(island.width))x\(Int(island.height))-\(Int(island.topRadius))-\(Int(island.bottomRadius))"
++        }
++        return key
+     }
+ 
+-    /// Edge masks (alpha is what counts in a mask), rendered at 1x since the light is soft:
+-    /// - base: a thin bright line right at the screen edge plus a soft shimmer fading inwards,
+-    /// - swell: a wider, gentle glow that only comes up when you speak.
+-    nonisolated private static func renderMasks(size: CGSize) -> (base: CGImage, swell: CGImage)? {
+-        guard
+-            let base = renderEdge(size: size, alpha: { distance in
+-                let line = max(0, min(1, 1 - (distance - 1.2) / 1.6))
+-                let shimmer = 0.5 * exp(-pow(distance / 14, 1.6))
+-                return line + shimmer * (1 - line)
+-            }),
+-            let swell = renderEdge(size: size, alpha: { distance in
+-                0.55 * exp(-pow(distance / 44, 1.4))
+-            })
+-        else { return nil }
+-        return (base, swell)
++    private static func mask(size: CGSize, island: NotchGlowIsland?, kind: MaskKind) -> CGImage? {
++        let key = cacheKey(size: size, island: island, kind: kind)
++        if let cached = maskCache[key] { return cached }
++        let image = renderMask(size: size, island: island, kind: kind)
++        maskCache[key] = image
++        return image
++    }
++
++    /// Alpha for a pixel at signed distance from the lit edge (negative inside the
++    /// lit area, positive in the corners outside the rounded screen and inside the island).
++    nonisolated private static func alpha(_ distance: CGFloat, kind: MaskKind) -> CGFloat {
++        let inside = -distance
++        switch kind {
++        case .base:
++            // A firm line of about 2 pt with a light, short shimmer.
++            if distance > 0 { return max(0, 1 - distance / 0.8) }
++            let line = max(0, min(1, 1 - (inside - 2.0) / 1.4))
++            let shimmer = 0.22 * exp(-pow(inside / 10, 1.5))
++            return line + shimmer * (1 - line)
++        case .swell:
++            // The same line, about 5 pt thick: faded in with the voice it makes the edge grow.
++            if distance > 0 { return max(0, 1 - distance / 0.8) }
++            let line = max(0, min(1, 1 - (inside - 4.5) / 3.0))
++            let shimmer = 0.18 * exp(-pow(inside / 16, 1.5))
++            return line + shimmer * (1 - line)
++        }
+     }
+ 
+-    /// Fills every pixel by its distance to the screen edge, so the falloff is perfectly smooth
+-    /// and follows the rounded display corners.
+-    nonisolated private static func renderEdge(size: CGSize, alpha: (CGFloat) -> CGFloat) -> CGImage? {
++    /// Fills every pixel by its distance to the lit edge: the rounded screen border and, when an
++    /// island is given, the island's sides and bottom (smoothly joined at the top corners).
++    nonisolated private static func renderMask(size: CGSize, island: NotchGlowIsland?, kind: MaskKind) -> CGImage? {
+         let width = max(1, Int(size.width.rounded(.up)))
+         let height = max(1, Int(size.height.rounded(.up)))
+         guard
+@@ -314,34 +458,51 @@ final class NotchScreenGlowWindow {
+         else { return nil }
+ 
+         let pixels = data.bindMemory(to: UInt8.self, capacity: width * height * 4)
+-        let halfWidth = CGFloat(width) / 2
+-        let halfHeight = CGFloat(height) / 2
+-        // MacBook displays are rounded at the top; keep the bottom corners nearly square.
+-        let topRadius: CGFloat = 10
+-        let bottomRadius: CGFloat = 6
+-        // Beyond this the light has faded to nothing, so the middle of the screen is skipped.
+-        let reach: CGFloat = 200
++        let screenHalfWidth = CGFloat(width) / 2
++        let screenHalfHeight = CGFloat(height) / 2
++        // Rounded like the notch, so the light follows smooth curves into the corners.
++        let screenRadius: CGFloat = 18
++
++        // Island as a box hanging from the top edge (its upper half is above the screen).
++        let islandHalfWidth = island.map { max(0, $0.width / 2 - $0.topRadius) } ?? 0
++        let islandHeight = island?.height ?? 0
++        let islandRadius = island.map { min($0.bottomRadius, islandHalfWidth, $0.height) } ?? 0
++        let blend = (island?.topRadius ?? 0) * 2
++        // Beyond this the light has faded to nothing.
++        let reach: CGFloat = 120
+ 
+         for row in 0..<height {
++            // Row 0 is the top of the image (and of the screen).
+             let y = CGFloat(row) + 0.5
+-            let radius = y < halfHeight ? topRadius : bottomRadius
+             let edgeY = min(y, CGFloat(height) - y)
+-            let qy = abs(y - halfHeight) - (halfHeight - radius)
+             for column in 0..<width {
+                 let x = CGFloat(column) + 0.5
+                 let offset = (row * width + column) * 4
+-                if edgeY > reach && min(x, CGFloat(width) - x) > reach {
++                let nearIsland = island != nil
++                    && y < islandHeight + reach
++                    && abs(x - screenHalfWidth) < islandHalfWidth + islandRadius + reach
++                if edgeY > reach && min(x, CGFloat(width) - x) > reach && !nearIsland {
+                     pixels[offset] = 0
+                     pixels[offset + 1] = 0
+                     pixels[offset + 2] = 0
+                     pixels[offset + 3] = 0
+                     continue
+                 }
+-                let qx = abs(x - halfWidth) - (halfWidth - radius)
+-                // Signed distance to the rounded rectangle (negative inside).
+-                let outside = (max(qx, 0) * max(qx, 0) + max(qy, 0) * max(qy, 0)).squareRoot()
+-                let signed = outside + min(max(qx, qy), 0) - radius
+-                let value = UInt8((max(0, min(1, alpha(max(0, -signed)))) * 255).rounded())
++
++                var distance = roundedBoxDistance(
++                    x: x - screenHalfWidth, y: y - screenHalfHeight,
++                    halfWidth: screenHalfWidth, halfHeight: screenHalfHeight, radius: screenRadius
++                )
++                if island != nil {
++                    let islandDistance = roundedBoxDistance(
++                        x: x - screenHalfWidth, y: y,
++                        halfWidth: islandHalfWidth, halfHeight: islandHeight, radius: islandRadius
++                    )
++                    // Lit area = inside the screen and outside the island (smooth at the joint).
++                    distance = smoothMax(distance, -islandDistance, blend: blend)
++                }
++
++                let value = UInt8((max(0, min(1, alpha(distance, kind: kind))) * 255).rounded())
+                 pixels[offset] = value
+                 pixels[offset + 1] = value
+                 pixels[offset + 2] = value
+@@ -350,4 +511,20 @@ final class NotchScreenGlowWindow {
+         }
+         return context.makeImage()
+     }
++
++    /// Signed distance to a rounded box centred at the origin (negative inside).
++    nonisolated private static func roundedBoxDistance(
++        x: CGFloat, y: CGFloat, halfWidth: CGFloat, halfHeight: CGFloat, radius: CGFloat
++    ) -> CGFloat {
++        let qx = abs(x) - halfWidth + radius
++        let qy = abs(y) - halfHeight + radius
++        let outside = (max(qx, 0) * max(qx, 0) + max(qy, 0) * max(qy, 0)).squareRoot()
++        return outside + min(max(qx, qy), 0) - radius
++    }
++
++    nonisolated private static func smoothMax(_ a: CGFloat, _ b: CGFloat, blend: CGFloat) -> CGFloat {
++        guard blend > 0 else { return max(a, b) }
++        let h = max(blend - abs(a - b), 0) / blend
++        return max(a, b) + h * h * blend * 0.25
++    }
+ }
+diff --git a/VoiceInk/Features/Recording/Views/NotchIslandView.swift b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+index 8dc4c8b..d283af4 100644
+--- a/VoiceInk/Features/Recording/Views/NotchIslandView.swift
++++ b/VoiceInk/Features/Recording/Views/NotchIslandView.swift
+@@ -89,16 +89,25 @@ struct NotchIslandView: View {
+         .frame(width: size.width, height: size.height, alignment: .top)
+         .background(Color.black)
+         .clipShape(shape)
++        // Rim and glow stay in place in every phase and only fade, so they always grow and shrink
++        // together with the island. With the screen glow on, that window draws the line around
++        // the island instead.
+         .overlay {
+-            rim(phase: phase, shape: shape, fadesOut: !joinsScreenGlow)
++            rim(phase: phase, shape: shape)
++                .opacity(phase.showsScreenGlow && !joinsScreenGlow ? 1 : 0)
+         }
+         .background {
+-            NotchIslandGlow(phase: phase, shape: shape, meter: { recorder.audioMeterSnapshot() })
++            NotchIslandGlow(
++                phase: phase,
++                shape: shape,
++                isOn: phase.showsScreenGlow && !joinsScreenGlow,
++                meter: { recorder.audioMeterSnapshot() }
++            )
+         }
+         .opacity(phase == .hidden ? 0 : 1)
+     }
+ 
+-    private static func shape(for phase: NotchIslandPhase) -> NotchShape {
++    static func shape(for phase: NotchIslandPhase) -> NotchShape {
+         switch phase {
+         case .hidden, .idle:
+             return NotchShape(topCornerRadius: 4, bottomCornerRadius: 8)
+@@ -109,27 +118,17 @@ struct NotchIslandView: View {
+         }
+     }
+ 
+-    @ViewBuilder
+-    private func rim(phase: NotchIslandPhase, shape: NotchShape, fadesOut: Bool) -> some View {
+-        switch phase {
+-        case .recording, .liveText:
+-            rimLine(shape: shape, color: NotchIslandGlow.recordingColor.opacity(0.8), fadesOut: fadesOut)
+-        case .processing:
+-            rimLine(shape: shape, color: NotchIslandGlow.processingColor.opacity(0.6), fadesOut: fadesOut)
+-        case .hidden, .idle, .hover, .menu, .assistant:
+-            EmptyView()
+-        }
+-    }
+-
+-    /// Sides and bottom only: a line along the top screen edge would show where the hardware
+-    /// notch is. On its own the sides fade out towards the top; with the screen glow they run
+-    /// up into the glowing top edge.
+-    private func rimLine(shape: NotchShape, color: Color, fadesOut: Bool) -> some View {
+-        NotchIslandRimShape(topCornerRadius: shape.topCornerRadius, bottomCornerRadius: shape.bottomCornerRadius)
+-            .stroke(color, style: StrokeStyle(lineWidth: 1.4, lineCap: .round))
++    /// Sides and bottom only (a line along the top screen edge would show where the hardware
++    /// notch is), fading out towards the top.
++    private func rim(phase: NotchIslandPhase, shape: NotchShape) -> some View {
++        let color = phase == .processing
++            ? NotchIslandGlow.processingColor.opacity(0.6)
++            : NotchIslandGlow.recordingColor.opacity(0.85)
++        return NotchIslandRimShape(topCornerRadius: shape.topCornerRadius, bottomCornerRadius: shape.bottomCornerRadius)
++            .stroke(color, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+             .mask {
+                 LinearGradient(
+-                    colors: [fadesOut ? .clear : .white, .white],
++                    colors: [.clear, .white],
+                     startPoint: .top,
+                     endPoint: UnitPoint(x: 0.5, y: 0.6)
+                 )
+@@ -563,31 +562,25 @@ struct NotchIslandGlow: View {
+ 
+     let phase: NotchIslandPhase
+     let shape: NotchShape
++    let isOn: Bool
+     let meter: () -> AudioMeter
+ 
+     var body: some View {
+-        switch phase {
+-        case .recording, .liveText:
+-            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { _ in
+-                let level = CGFloat(max(0, min(1, pow(meter().averagePower, 0.7))))
+-                glow(color: Self.recordingColor, strength: 0.5 + 0.4 * level, radius: 9 + 9 * level)
+-            }
+-        case .processing:
+-            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+-                let time = context.date.timeIntervalSinceReferenceDate
+-                let pulse = CGFloat((sin(time * 3.2) + 1) / 2)
+-                glow(color: Self.processingColor, strength: 0.32 + 0.25 * pulse, radius: 8 + 4 * pulse)
+-            }
+-        case .hidden, .idle, .hover, .menu, .assistant:
+-            Color.clear
++        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isOn)) { context in
++            let time = context.date.timeIntervalSinceReferenceDate
++            let processing = phase == .processing
++            let level = isOn && !processing ? CGFloat(max(0, min(1, pow(meter().averagePower, 0.7)))) : 0
++            let pulse = CGFloat((sin(time * 3.2) + 1) / 2)
++            let color = processing ? Self.processingColor : Self.recordingColor
++            let strength = processing ? 0.32 + 0.25 * pulse : 0.5 + 0.4 * level
++            let radius = processing ? 8 + 4 * pulse : 9 + 9 * level
++
++            shape
++                .fill(Color.black)
++                .shadow(color: color.opacity(strength), radius: radius * 0.5)
++                .shadow(color: color.opacity(strength * 0.6), radius: radius * 1.4)
+         }
+-    }
+-
+-    private func glow(color: Color, strength: CGFloat, radius: CGFloat) -> some View {
+-        shape
+-            .fill(Color.black)
+-            .shadow(color: color.opacity(strength), radius: radius * 0.5)
+-            .shadow(color: color.opacity(strength * 0.6), radius: radius * 1.4)
++        .opacity(isOn ? 1 : 0)
+     }
+ }
+ 
