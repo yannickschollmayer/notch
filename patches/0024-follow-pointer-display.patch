@@ -1,0 +1,79 @@
+diff --git a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+index a8fc578..32698cc 100644
+--- a/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
++++ b/VoiceInk/Features/Recording/Presentation/NotchIslandController.swift
+@@ -711,2 +711,42 @@ final class NotchIslandController {
+ 
++    /// The display the pointer is on: the one you are working on.
++    private static func pointerScreen() -> NSScreen? {
++        let point = NSEvent.mouseLocation
++        let screens = NSScreen.screens
++        if let screen = screens.first(where: { NSMouseInRect(point, $0.frame, false) }) {
++            return screen
++        }
++        // Right on an edge: the nearest display.
++        func distance(_ frame: NSRect) -> CGFloat {
++            let dx = max(frame.minX - point.x, 0, point.x - frame.maxX)
++            let dy = max(frame.minY - point.y, 0, point.y - frame.maxY)
++            return dx * dx + dy * dy
++        }
++        return screens.min(by: { distance($0.frame) < distance($1.frame) }) ?? idleScreen()
++    }
++
++    /// Phases in which the island quietly moves along when the pointer goes to another display.
++    /// Open menus, players and dictations stay where they are.
++    private static func followsPointer(_ phase: NotchIslandPhase) -> Bool {
++        switch phase {
++        case .hidden, .idle, .music, .shelfPeek, .dropReady:
++            return true
++        case .hover, .menu, .player, .recording, .processing, .liveText, .assistant, .dropTarget, .fileTask,
++            .shelf:
++            return false
++        }
++    }
++
++    /// Keeps the island (and with it the screen glow) on the display you are working on. On a
++    /// display without a notch it stays invisible until something happens.
++    private func followPointerToScreen() {
++        guard panel != nil, !model.sessionActive,
++            !NSMouseInRect(NSEvent.mouseLocation, model.geometry.screenFrame, false),
++            Self.followsPointer(model.phase),
++            let screen = Self.pointerScreen(), screen.frame != model.geometry.screenFrame
++        else { return }
++        repositionTask?.cancel()
++        place(on: screen)
++    }
++
+     // MARK: Public API
+@@ -716,3 +756,3 @@ final class NotchIslandController {
+         ensurePanel()
+-        guard let screen = model.sessionActive ? RecorderScreenResolver.resolve() : NotchIslandController.idleScreen() else { return }
++        guard let screen = NotchIslandController.pointerScreen() else { return }
+         place(on: screen)
+@@ -723,6 +763,6 @@ final class NotchIslandController {
+ 
+-    /// A dictation started: move to the screen being worked on and expand.
++    /// A dictation started: move to the screen being worked on (where the pointer is) and expand.
+     @discardableResult
+     func beginSession() -> Bool {
+-        guard let screen = RecorderScreenResolver.resolve() else {
++        guard let screen = NotchIslandController.pointerScreen() else {
+             logger.error("Notch island: no screen for session")
+@@ -748,3 +788,3 @@ final class NotchIslandController {
+ 
+-    /// The dictation ended: collapse, then return to the notch display if it moved.
++    /// The dictation ended: collapse, then follow the pointer if it went to another display.
+     func endSession() {
+@@ -756,3 +796,3 @@ final class NotchIslandController {
+             guard let self, !Task.isCancelled, !self.model.sessionActive else { return }
+-            if let screen = NotchIslandController.idleScreen(),
++            if let screen = NotchIslandController.pointerScreen(),
+                 NotchGeometry.make(for: screen) != self.model.geometry
+@@ -901,2 +941,3 @@ final class NotchIslandController {
+         }
++        followPointerToScreen()
+         updatePointerState()
+@@ -954,2 +995,3 @@ final class NotchIslandController {
+         dragReleasedAt = nil
++        followPointerToScreen()
+         updatePointerState()
